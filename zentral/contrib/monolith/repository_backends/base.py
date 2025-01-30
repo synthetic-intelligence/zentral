@@ -1,209 +1,284 @@
 from datetime import datetime
+import hashlib
 import logging
-import os.path
 import plistlib
-from zentral.contrib.monolith.events import post_monolith_repository_updates
+import uuid
+from django.db import transaction
+from django.db.models import Count, Q
 from zentral.contrib.monolith.models import Catalog, Manifest, PkgInfo, PkgInfoCategory, PkgInfoName
-from zentral.utils.local_dir import get_and_create_local_dir
+from zentral.core.events.base import AuditEvent, EventRequest
+from zentral.core.secret_engines import decrypt, decrypt_str, encrypt_str, rewrap
+
 
 logger = logging.getLogger('zentral.contrib.monolith.repository_backends.base')
 
 
-class BaseRepository(object):
-    def __init__(self, config):
-        self.manual_catalog_management = config.get("manual_catalog_management", False)
-        if self.manual_catalog_management:
-            self.default_catalog_name = config.get("default_catalog", "Not assigned").strip()
-        else:
-            self.default_catalog_name = None
+class SyncEventManager:
+    def __init__(self, repository, request=None):
+        self.repository_pk = repository.pk
+        self.event_request = EventRequest.build_from_request(request) if request else None
+        self.events = []
+        self.event_uuid = uuid.uuid4()
+        self.event_index = 0
 
-    def serialize_for_event(self):
-        return {"module": self.__module__}
+    def audit_callback(self, instance, action, prev_value=None):
+        event = AuditEvent.build(
+            instance, action, prev_value=prev_value,
+            event_uuid=self.event_uuid, event_index=self.event_index,
+            event_request=self.event_request
+        )
+        event.metadata.add_objects({"monolith_repository": ((self.repository_pk,),)})
+        self.events.append(event)
+        self.event_index += 1
 
-    def get_all_catalog_local_path(self):
-        return os.path.join(get_and_create_local_dir("monolith", "repository"), "all_catalog.xml")
+    def post_events(self):
+        for event in self.events:
+            event.post()
 
-    def _import_pkg_info_data_catalogs(self, pkg_info_data, event_payloads):
+
+class BaseRepository:
+    kwargs_keys = ()
+    encrypted_kwargs_keys = ()
+    form_class = None
+
+    def __init__(self, repository, load=True):
+        self.repository = repository
+        self.name = repository.name
+        if load:
+            self.load()
+
+    def load(self):
+        backend_kwargs = self.get_kwargs()
+        for key in self.kwargs_keys:
+            setattr(self, key, backend_kwargs.get(key))
+
+    # secrets
+
+    def _get_secret_engine_kwargs(self, subfield):
+        if not self.name:
+            raise ValueError("Repository must have a name")
+        return {"field": f"backend_kwargs.{subfield}",
+                "model": "monolith.repository",
+                "name": self.name}
+
+    def get_kwargs(self):
+        if not isinstance(self.repository.backend_kwargs, dict):
+            raise ValueError("Repository hasn't been initialized")
+        return {
+            k: decrypt_str(v, **self._get_secret_engine_kwargs(k)) if k in self.encrypted_kwargs_keys else v
+            for k, v in self.repository.backend_kwargs.items()
+        }
+
+    def get_kwargs_for_event(self):
+        if not isinstance(self.repository.backend_kwargs, dict):
+            raise ValueError("Repository hasn't been initialized")
+        return {
+            k if k not in self.encrypted_kwargs_keys else f"{k}_hash":
+            hashlib.sha256(decrypt(v, **self._get_secret_engine_kwargs(k))).hexdigest()
+            if k in self.encrypted_kwargs_keys else v
+            for k, v in self.repository.backend_kwargs.items()
+            if v is not None
+        }
+
+    def set_kwargs(self, kwargs):
+        self.repository.backend_kwargs = {
+            k: encrypt_str(v, **self._get_secret_engine_kwargs(k)) if k in self.encrypted_kwargs_keys else v
+            for k, v in kwargs.items()
+            if v
+        }
+
+    def rewrap_kwargs(self):
+        self.repository.backend_kwargs = {
+            k: rewrap(v, **self._secret_engine_kwargs(k)) if k in self.encrypted_kwargs_keys else v
+            for k, v in self.repository.backend_kwargs.items()
+        }
+
+    # sync
+
+    def _import_category(self, name, audit_callback):
+        pic, created = PkgInfoCategory.objects.get_or_create(repository=self.repository, name=name)
+        if created and audit_callback:
+            audit_callback(pic, AuditEvent.Action.CREATED)
+        return pic
+
+    def _import_name(self, name, audit_callback):
+        pin, created = PkgInfoName.objects.get_or_create(name=name)
+        if created and audit_callback:
+            audit_callback(pin, AuditEvent.Action.CREATED)
+        return pin
+
+    def _import_catalogs(self, pkg_info_data, audit_callback):
         catalogs = []
-        if self.default_catalog_name:
-            # force the catalog to the default catalog
-            pkg_info_catalogs = [self.default_catalog_name]
-        else:
-            # take the catalogs from the pkg info data
-            pkg_info_catalogs = pkg_info_data.get("catalogs", [])
+        pkg_info_catalogs = pkg_info_data.get("catalogs", [])
         for catalog_name in pkg_info_catalogs:
             catalog_name = catalog_name.strip()
-            event_payload = {"catalog": {"name": catalog_name},
-                             "type": "catalog"}
             try:
-                catalog = Catalog.objects.get(name=catalog_name)
+                catalog = Catalog.objects.get(repository=self.repository, name=catalog_name)
             except Catalog.DoesNotExist:
-                catalog = Catalog.objects.create(name=catalog_name)
-                event_payload["action"] = "added"
+                catalog = Catalog.objects.create(repository=self.repository, name=catalog_name)
+                audit_callback(catalog, AuditEvent.Action.CREATED)
             else:
                 if catalog.archived_at:
+                    prev_value = catalog.serialize_for_event()
                     catalog.archived_at = None
                     catalog.save()
-                    event_payload["action"] = "unarchived"
+                    audit_callback(catalog, AuditEvent.Action.UPDATED, prev_value)
             catalogs.append(catalog)
-            if "action" in event_payload:
-                event_payload["catalog"]["id"] = catalog.id
-                event_payloads.append(event_payload)
         return catalogs
 
-    def _import_pkg_info_data(self, pkg_info_data, event_payloads):
+    def _import_pkg_info(self, pkg_info_data, audit_callback):
         name = pkg_info_data['name']
         version = pkg_info_data['version']
-        logger.debug('PKGINFO %s %s', name, version)
         # catalogs
-        catalogs = self._import_pkg_info_data_catalogs(pkg_info_data, event_payloads)
+        catalogs = self._import_catalogs(pkg_info_data, audit_callback)
         if not catalogs:
             logger.warning('PKGINFO %s %s w/o catalogs', name, version)
             return catalogs, None
         # name
-        pkg_info_name, _ = PkgInfoName.objects.get_or_create(name=name)
+        pkg_info_name = self._import_name(name, audit_callback)
         # category
         pkg_info_category = None
-        category = pkg_info_data.get('category', None)
-        if category:
-            pkg_info_category, pkg_info_category_created = PkgInfoCategory.objects.get_or_create(name=category)
-            if pkg_info_category_created:
-                event_payloads.append({"category": {"name": pkg_info_category.name,
-                                                    "id": pkg_info_category.id},
-                                       "type": "category",
-                                       "action": "added"})
+        category_name = pkg_info_data.get('category', None)
+        if category_name:
+            pkg_info_category = self._import_category(category_name, audit_callback)
         # requires
-        requires = [pif for pif, created in (PkgInfoName.objects.get_or_create(name=n)
-                                             for n in pkg_info_data.get('requires', []))]
+        requires = [self._import_name(n, audit_callback)
+                    for n in set(pkg_info_data.get('requires', []))]
         # update_for
-        update_for = [pif for pif, created in (PkgInfoName.objects.get_or_create(name=n)
-                                               for n in pkg_info_data.get('update_for', []))]
+        update_for = [self._import_name(n, audit_callback)
+                      for n in set(pkg_info_data.get('update_for', []))]
         # serialize pkg_info_data
         for key, val in pkg_info_data.items():
             if isinstance(val, datetime):
                 pkg_info_data[key] = val.isoformat()
         # save PkgInfo in db
-        event_payload = {"pkg_info": {"name": name,
-                                      "version": version},
-                         "type": "pkg_info"}
         try:
             pkg_info = (PkgInfo.objects.prefetch_related("catalogs", "requires", "update_for")
-                                       .get(name=pkg_info_name, version=version))
+                                       .select_related("repository", "name", "category")
+                                       .get(repository=self.repository,
+                                            name=pkg_info_name,
+                                            version=version))
         except PkgInfo.DoesNotExist:
-            pkg_info = PkgInfo.objects.create(name=pkg_info_name,
+            pkg_info = PkgInfo.objects.create(repository=self.repository,
+                                              name=pkg_info_name,
                                               version=version,
                                               category=pkg_info_category,
                                               data=pkg_info_data)
             pkg_info.catalogs.set(catalogs)
             pkg_info.requires.set(requires)
             pkg_info.update_for.set(update_for)
-            event_payload["action"] = "added"
+            audit_callback(pkg_info, AuditEvent.Action.CREATED)
         else:
-            # if the pkg exists, but is archived, consider it like a new pkg
+            updated = False
+            prev_value = pkg_info.serialize_for_event()
+            # unarchive if necessary
             if pkg_info.archived_at:
-                diff = None
                 pkg_info.archived_at = None
-                event_payload["action"] = "added"
-            else:
-                diff = {}
-
+                updated = True
+            # update the local attribute
+            if pkg_info.local:
+                pkg_info.local = False
+                updated = True
             # update category if necessary
             pkg_info_old_category = pkg_info.category
             if pkg_info_old_category != pkg_info_category:
                 pkg_info.category = pkg_info_category
-                if diff is not None:
-                    attr_diff = {}
-                    if pkg_info_old_category:
-                        attr_diff["removed"] = str(pkg_info_old_category)
-                    if pkg_info_category:
-                        attr_diff["added"] = str(pkg_info_category)
-                    diff["category"] = attr_diff
-                    event_payload["action"] = "updated"
-
+                updated = True
             # update data if necessary
             pkg_info_old_data = pkg_info.data
             if pkg_info_old_data != pkg_info_data:
                 pkg_info.data = pkg_info_data
-                if diff is not None:
-                    attr_diff = {}
-                    if pkg_info_old_data:
-                        attr_diff["removed"] = pkg_info_old_data
-                    if pkg_info_data:
-                        attr_diff["added"] = pkg_info_data
-                    diff["data"] = attr_diff
-                    event_payload["action"] = "updated"
-
-            # save updates
-            if event_payload.get("action"):
-                pkg_info.save()
-
+                updated = True
             # update m2m attributes
-            pkg_info_m2m_updates = [("requires", requires),
-                                    ("update_for", update_for)]
-            if not self.manual_catalog_management:
-                # need to update the pkg info catalogs too
-                pkg_info_m2m_updates.append(("catalogs", catalogs))
-
-            for pkg_info_attr, pkg_info_values in pkg_info_m2m_updates:
+            for pkg_info_attr, pkg_info_values in (
+                ("requires", requires),
+                ("update_for", update_for),
+                ("catalogs", catalogs)
+            ):
                 pkg_info_old_values = set(getattr(pkg_info, pkg_info_attr).all())
                 pkg_info_values = set(pkg_info_values)
                 if pkg_info_old_values != pkg_info_values:
                     getattr(pkg_info, pkg_info_attr).set(pkg_info_values)
-                    if diff is not None:
-                        attr_diff = {}
-                        removed = pkg_info_old_values - pkg_info_values
-                        if removed:
-                            attr_diff = {"removed": sorted(str(r) for r in removed)}
-                        added = pkg_info_values - pkg_info_old_values
-                        if added:
-                            attr_diff = {"added": sorted(str(a) for a in added)}
-                        diff[pkg_info_attr] = attr_diff
-                        event_payload["action"] = "updated"
+                    updated = True
+            # save updates
+            if updated:
+                pkg_info.save()  # even if only the m2m attributes were updated, for updated_at
+                audit_callback(pkg_info, AuditEvent.Action.UPDATED, prev_value)
 
-            # include the updates in the event payload
-            if diff:
-                event_payload["pkg_info"]["diff"] = diff
+        return catalogs, pkg_info
 
-        if "action" in event_payload:
-            event_payloads.append(event_payload)
+    def _archive_catalog(self, catalog, audit_callback):
+        prev_value = catalog.serialize_for_event()
+        catalog.archived_at = datetime.utcnow()
+        catalog.save()
+        audit_callback(catalog, AuditEvent.Action.UPDATED, prev_value)
 
-        return catalogs, pkg_info.get_key()
+    def _archive_pkg_info(self, pkg_info, audit_callback):
+        prev_value = pkg_info.serialize_for_event()
+        pkg_info.archived_at = datetime.utcnow()
+        pkg_info.save()
+        audit_callback(pkg_info, AuditEvent.Action.UPDATED, prev_value)
 
-    def sync_catalogs(self):
-        with open(self.download_all_catalog(), "rb") as f:
-            catalog_plist = plistlib.load(f)
-        found_pkg_infos = set([])
-        found_catalogs = set([])
-        event_payloads = []
+    def _bump_manifest(self, manifest, audit_callback):
+        prev_value = manifest.serialize_for_event()
+        manifest.bump_version()
+        audit_callback(manifest, AuditEvent.Action.UPDATED, prev_value)
+
+    def sync_catalogs(self, event_request=None):
+        # initialize sync event manager
+        sync_event_manager = SyncEventManager(self.repository, event_request)
+        audit_callback = sync_event_manager.audit_callback
+
+        found_pkg_info_pks = set([])
+        found_catalog_pks = set([])
+
+        # initialize repository icon hashes
+        repo_icon_hashes = {}
+        icon_hashes_content = self.get_icon_hashes_content()
+        if icon_hashes_content:
+            icon_hashes = plistlib.loads(icon_hashes_content)
+        else:
+            icon_hashes = {}
         # update or create current pkg_infos
-        for pkg_info_data in catalog_plist:
-            catalogs, pkg_info_key = self._import_pkg_info_data(pkg_info_data, event_payloads)
-            found_catalogs.update(catalogs)
-            if pkg_info_key:
-                if pkg_info_key in found_pkg_infos:
-                    logger.warning('PKGINFO %s %s already found', pkg_info_key[0], pkg_info_key[1])
-                else:
-                    found_pkg_infos.update([pkg_info_key])
-        # archive old catalogs if auto catalog management
-        if not self.manual_catalog_management:
-            for c in Catalog.objects.filter(archived_at__isnull=True):
-                if c not in found_catalogs:
-                    c.archived_at = datetime.now()
-                    c.save()
-                    event_payloads.append({"catalog": {"name": c.name,
-                                                       "id": c.id},
-                                           "type": "catalog",
-                                           "action": "archived"})
-        # archive old pkg_infos
-        for pkg_info in PkgInfo.objects.select_related("name").filter(archived_at__isnull=True):
-            if pkg_info.get_key() not in found_pkg_infos:
-                pkg_info.archived_at = datetime.now()
-                pkg_info.save()
-                event_payloads.append({"pkg_info": {"name": pkg_info.name.name,
-                                                    "version": pkg_info.version},
-                                       "type": "pkg_info",
-                                       "action": "archived"})
+        for pkg_info_data in plistlib.loads(self.get_all_catalog_content()):
+            catalogs, pkg_info = self._import_pkg_info(pkg_info_data, audit_callback)
+            found_catalog_pks.update(c.pk for c in catalogs)
+            if pkg_info:
+                found_pkg_info_pks.add(pkg_info.pk)
+                icon_hash = icon_hashes.get(pkg_info.get_original_icon_name())
+                if icon_hash:
+                    repo_icon_hashes[pkg_info.get_monolith_icon_name()] = icon_hash
+        # archive unknown non-local pkg_infos
+        for pkg_info in (PkgInfo.objects.prefetch_related("catalogs", "requires", "update_for")
+                                        .select_related("category", "name")
+                                        .filter(repository=self.repository, archived_at__isnull=True)
+                                        .exclude(Q(local=True) | Q(pk__in=found_pkg_info_pks))):
+            self._archive_pkg_info(pkg_info, audit_callback)
+        # archive old catalogs
+        for c in (Catalog.objects.annotate(pkginfo_count=Count("pkginfo",
+                                                               filter=Q(pkginfo__archived_at__isnull=True)))
+                                 .filter(repository=self.repository, archived_at__isnull=True, pkginfo_count=0)
+                                 .exclude(pk__in=found_catalog_pks)):
+            self._archive_catalog(c, audit_callback)
+        # update repository
+        self.repository.icon_hashes = repo_icon_hashes
+        self.repository.client_resources = list(self.iter_client_resources())
+        self.repository.last_synced_at = datetime.utcnow()
+        self.repository.save()
         # bump versions of manifests connected to found catalogs
-        for manifest in Manifest.objects.distinct().filter(manifestcatalog__catalog__in=found_catalogs):
-            manifest.bump_version()
-        post_monolith_repository_updates(self, event_payloads)
+        for manifest in Manifest.objects.distinct().filter(manifestcatalog__catalog__pk__in=found_catalog_pks):
+            self._bump_manifest(manifest, audit_callback)
+
+        # post events
+        transaction.on_commit(lambda: sync_event_manager.post_events())
+
+    # to implement in the subclasses
+
+    def get_all_catalog_content(self):
+        raise NotImplementedError
+
+    def get_icon_hashes_content(self):
+        raise NotImplementedError
+
+    def iter_client_resources(self):
+        raise NotImplementedError

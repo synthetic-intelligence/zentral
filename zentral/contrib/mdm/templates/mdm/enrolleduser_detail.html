@@ -1,48 +1,55 @@
 {% extends 'base.html' %}
-{% load bootstrap %}
+{% load base_extras ui_extras %}
 
 {% block content %}
 <ol class="breadcrumb">
-  <li><a href="/">Home</a></li>
-  <li><a href="{% url 'mdm:index' %}">MDM</a></li>
-  <li><a href="{% url 'mdm:enrolled_devices' %}">Devices</a></li>
-  <li><a href="{{ enrolled_device.get_absolute_url }}">{{ enrolled_device }}</a></li>
-  <li class="active">User {{ object }}</li>
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'mdm:index' %}">MDM</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'mdm:enrolled_devices' %}">Devices</a></li>
+  <li class="breadcrumb-item"><a href="{{ enrolled_device.get_absolute_url }}">{{ enrolled_device.udid|privacywrapper }}</a></li>
+  <li class="breadcrumb-item active">User {{ object }}</li>
 </ol>
 
+<div class="object-details">
+    <div class="d-flex align-items-center mb-1">
+        <h2 class="m-0">{{ object }}</h2>
+    </div>
+    <div class="d-flex align-items-center mb-3">
+        <h3 class="m-0 fs-5 text-secondary">User</h3>
+    </div>
 
-<h3>User {{ object }}</h3>
+    <table class="table-object-properties">
+    <tbody>
+        <tr>
+        <th style="width:160px">User ID</th>
+        <td><code>{{ object.user_id|privacywrapper }}</code></th>
+        </tr>
+        <tr>
+        <th>Short name</th>
+        <td>{{ object.short_name }}</th>
+        </tr>
+        <tr>
+        <th>Long name</th>
+        <td>{{ object.long_name }}</th>
+        </tr>
+        <tr>
+        <th>Device</th>
+        <td>
+            {% if perms.mdm.view_enrolleddevice %}
+            <a href="{{ enrolled_device.get_absolute_url }}">{{ enrolled_device.udid|privacywrapper }}</a>
+            {% else %}
+            {{ enrolled_device.udid|privacywrapper }}
+            {% endif %}
+        </td>
+    </tbody>
+    </table>
+</div>
 
-<table class="table table-condensed">
-  <tbody>
-    <tr>
-      <th style="width:160px">User ID</th>
-      <td><code>{{ object.user_id }}</code></th>
-    </tr>
-    <tr>
-      <th>Short name</th>
-      <td>{{ object.short_name }}</th>
-    </tr>
-    <tr>
-      <th>Long name</th>
-      <td>{{ object.long_name }}</th>
-    </tr>
-    <tr>
-      <th>Device</th>
-      <td>
-        {% if perms.mdm.view_enrolleddevice %}
-        <a href="{{ enrolled_device.get_absolute_url }}">{{ enrolled_device }}</a>
-        {% else %}
-        {{ enrolled_device }}
-        {% endif %}
-      </td>
-  </tbody>
-</table>
 
-<h3>{{ installed_artifacts_count }} Artifact{{ installed_artifacts_count|pluralize }}</h3>
+<h3>Artifact{{ target_artifacts_count|pluralize }} ({{ target_artifacts_count }})</h3>
 
-{% if installed_artifacts_count %}
-<table class="table table-condensed">
+{% if target_artifacts_count %}
+<table class="table table-striped align-middle">
   <thead>
     <tr>
       <th>Type</th>
@@ -53,8 +60,8 @@
     </tr>
   </thead>
   <tbody>
-    {% for installed_artifact in installed_artifacts %}
-    {% with installed_artifact.artifact_version as artifact_version %}
+    {% for target_artifact in target_artifacts %}
+    {% with target_artifact.artifact_version as artifact_version %}
     {% with artifact_version.artifact as artifact %}
     <tr>
       <td>{{ artifact.get_type_display }}</td>
@@ -72,9 +79,19 @@
         {{ artifact_version.version }}
         {% endif %}
       </td>
-      <td>{{ installed_artifact.get_status_display }}</td>
       <td>
-        {{ installed_artifact.updated_at|date:"SHORT_DATETIME_FORMAT" }}
+        {{ target_artifact.get_status_display }}
+        {% if target_artifact.extra_info.reasons %}
+        <a data-bs-toggle="collapse" href="#mi-{{ target_artifact.pk }}">more info</a>
+        <div  class="collapse" id="mi-{{ target_artifact.pk }}">
+          {% for reason in target_artifact.extra_info.reasons %}
+          {{ reason|pythonprettyprint }}
+          {% endfor %}
+        </div>
+        {% endif %}
+      </td>
+      <td>
+        {{ target_artifact.updated_at|date:"SHORT_DATETIME_FORMAT" }}
       </td>
     </tr>
     {% endwith %}
@@ -84,16 +101,22 @@
 </table>
 {% endif %}
 
-<h3>Last commands</h3>
+{% if commands_count > 0 %}
+<div class="d-flex align-items-center mb-1">
+    <h3 class="m-0">Last commands</h3>
+    <div class="ms-auto">
+        {% if perms.mdm.change_enrolleduser %}
+        <form style="display:inline-block" method="POST" action="{% url 'mdm:poke_enrolled_user' enrolled_device.pk object.pk %}">{% csrf_token %}
+            <button type="submit" class="btn btn-success" {% if not enrolled_device.can_be_poked %}disabled="disabled"{% endif %}
+                data-bs-toggle="tooltip" data-bs-placement="bottom" data-bs-title="Poke!">
+                <i class="bi bi-hand-index"></i>
+            </button>
+        </form>
+        {% endif %}
+    </div>
+</div>
 
-{% if perms.mdm.change_enrolleduser %}
-<form style="display:inline-block" method="POST" action="{% url 'mdm:poke_enrolled_user' enrolled_device.pk object.pk %}">{% csrf_token %}
-  <button type="submit" class="btn btn-success" {% if not enrolled_device.can_be_poked %}disabled="disabled"{% endif %}>Poke!</button>
-</form>
-{% endif %}
-
-{% if commands_count %}
-<table class="table table-condensed">
+<table class="table table-striped align-middle">
   <thead>
     <tr>
       <th>Name</th>
@@ -134,9 +157,8 @@
       <td>
         {{ command.get_status_display|default:"-" }}
         {% if command.result %}
-        <a class="btn btn-default btn-xs" href="{% url 'mdm:download_enrolled_user_command_result' command.uuid %}">
-          <span class="glyphicon glyphicon-download" aria-hidden="true"></span>
-        </a>
+            {% url 'mdm:download_enrolled_device_command_result' command.uuid as url %}
+            {% button 'DOWNLOAD' url "Download Result" %}
         {% endif %}
       </td>
     </tr>

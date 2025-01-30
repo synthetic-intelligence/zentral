@@ -61,6 +61,32 @@ class JamfSetupViewsTestCase(TestCase):
                                         regex=r"^YOLOFOMO: (.*)$",
                                         replacement=r"\1")
 
+    # jamf index
+
+    def test_jamf_index_redirect(self):
+        self._login_redirect(reverse("jamf:index"))
+
+    def test_jamf_index_permission_denied(self):
+        self._login()
+        response = self.client.get(reverse("jamf:index"))
+        self.assertEqual(response.status_code, 403)
+
+    def test_jamf_index(self):
+        self._login("jamf.view_jamfinstance")
+        jamf_instance = self._force_jamf_instance()
+        response = self.client.get(reverse("jamf:index"))
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "jamf/index.html")
+        self.assertContains(response, jamf_instance.host)
+
+    def test_jamf_index_no_list(self):
+        self._login("jamf.view_tagconfig")
+        jamf_instance = self._force_jamf_instance()
+        response = self.client.get(reverse("jamf:index"))
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "jamf/index.html")
+        self.assertNotContains(response, jamf_instance.host)
+
     # jamf instances
 
     def test_jamf_instances_redirect(self):
@@ -76,7 +102,7 @@ class JamfSetupViewsTestCase(TestCase):
         response = self.client.get(reverse("jamf:jamf_instances"))
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "jamf/jamfinstance_list.html")
-        self.assertContains(response, "0 jamf instances")
+        self.assertContains(response, "Instances (0)")
 
     # create jamf instance
 
@@ -93,7 +119,7 @@ class JamfSetupViewsTestCase(TestCase):
         response = self.client.get(reverse("jamf:create_jamf_instance"))
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "jamf/jamfinstance_form.html")
-        self.assertContains(response, "Create jamf instance")
+        self.assertContains(response, "Create Instance")
 
     def test_create_jamf_instance_post(self):
         self._login("jamf.add_jamfinstance", "jamf.view_jamfinstance", "jamf.view_tagconfig")
@@ -112,7 +138,7 @@ class JamfSetupViewsTestCase(TestCase):
                                      "inventory_completed_heartbeat_timeout": 5432},
                                     follow=True)
         self.assertEqual(response.template_name, ["jamf/jamfinstance_detail.html"])
-        self.assertContains(response, "0 Tag configs")
+        self.assertContains(response, "Tag configs (0)")
         jamf_instance = response.context["object"]
         self.assertEqual(jamf_instance.version, 0)
         self.assertEqual(jamf_instance.get_password(), "pwd")
@@ -142,9 +168,9 @@ class JamfSetupViewsTestCase(TestCase):
                                      "inventory_completed_heartbeat_timeout": 5432},
                                     follow=True)
         self.assertEqual(response.template_name, ["jamf/jamfinstance_form.html"])
-        self.assertFormError(response, "form", "principal_user_uid_extension_attribute",
+        self.assertFormError(response.context["form"], "principal_user_uid_extension_attribute",
                              "This field is required to collect the principal user information")
-        self.assertFormError(response, "form", "principal_user_pn_extension_attribute",
+        self.assertFormError(response.context["form"], "principal_user_pn_extension_attribute",
                              "This field is required to collect the principal user information")
 
     # delete jamf instance
@@ -163,7 +189,7 @@ class JamfSetupViewsTestCase(TestCase):
         jamf_instance = self._force_jamf_instance()
         self._login("jamf.delete_jamfinstance")
         response = self.client.get(reverse("jamf:delete_jamf_instance", args=(jamf_instance.pk,)))
-        self.assertContains(response, "Delete jamf instance")
+        self.assertContains(response, "Delete Instance")
 
     @patch("zentral.contrib.jamf.api_client.APIClient.cleanup")
     def test_delete_jamf_instance_post_cleanup_ok(self, cleanup):
@@ -219,7 +245,7 @@ class JamfSetupViewsTestCase(TestCase):
         jamf_instance = self._force_jamf_instance()
         self._login("jamf.change_jamfinstance")
         response = self.client.get(reverse("jamf:update_jamf_instance", args=(jamf_instance.pk,)))
-        self.assertContains(response, "Update jamf instance")
+        self.assertContains(response, "Update Instance")
         self.assertContains(response, jamf_instance.get_password())
 
     def test_update_jamf_instance_post(self):
@@ -236,7 +262,7 @@ class JamfSetupViewsTestCase(TestCase):
                                      "inventory_completed_heartbeat_timeout": 5432},
                                     follow=True)
         self.assertTemplateUsed(response, "jamf/jamfinstance_detail.html")
-        self.assertContains(response, "0 Tag configs")
+        self.assertContains(response, "Tag configs (0)")
         self.assertContains(response, "https://yo.example2.com:8443/JSSResource")
         jamf_instance2 = response.context["object"]
         self.assertEqual(jamf_instance, jamf_instance2)
@@ -277,7 +303,7 @@ class JamfSetupViewsTestCase(TestCase):
                                      "replacement": r"\1"},
                                     follow=True)
         self.assertTemplateUsed(response, "jamf/jamfinstance_detail.html")
-        self.assertContains(response, "1 Tag config")
+        self.assertContains(response, "Tag config (1)")
         self.assertContains(response, t.name)
 
     def test_create_tag_config_error(self):
@@ -317,7 +343,7 @@ class JamfSetupViewsTestCase(TestCase):
                                      "replacement": r"haha: \1"},
                                     follow=True)
         self.assertTemplateUsed(response, "jamf/jamfinstance_detail.html")
-        self.assertContains(response, "1 Tag config")
+        self.assertContains(response, "Tag config (1)")
         self.assertContains(response, "haha")
 
     # delete tag config
@@ -341,4 +367,4 @@ class JamfSetupViewsTestCase(TestCase):
         response = self.client.post(reverse("jamf:delete_tag_config", args=(jamf_instance.pk, tag_config.pk)),
                                     follow=True)
         self.assertTemplateUsed(response, "jamf/jamfinstance_detail.html")
-        self.assertContains(response, "0 Tag configs")
+        self.assertContains(response, "Tag configs (0)")

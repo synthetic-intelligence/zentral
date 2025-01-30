@@ -1,0 +1,21 @@
+{% extends 'base.html' %}
+
+{% block content %}
+<ol class="breadcrumb">
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'intune:index' %}">Microsoft Intune Inventory</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'intune:tenants' %}">Tenants</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'intune:tenant' object.pk %}">{{ instance }}</a></li>
+  <li class="breadcrumb-item active">Delete tenant</li>
+</ol>
+
+<h2>Delete Microsoft Intune Inventory Tenant</h2>
+
+<form method="POST" class="form">{% csrf_token %}
+  <p>Do you really want to delete this Microsoft Intune Inventory Tenant?</p>
+  <p>
+    <a class="btn btn-outline-secondary" href="{% url 'intune:tenant' object.pk %}">Cancel</a>
+    <button class="btn btn-danger" type="submit">Delete</button>
+  </p>
+</form>
+{% endblock %}

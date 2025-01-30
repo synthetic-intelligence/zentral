@@ -5,7 +5,7 @@ from django.urls import reverse
 from django.utils.html import escape, conditional_escape
 from django.utils.safestring import mark_safe
 from zentral.contrib.inventory.conf import (ANDROID, IOS, IPADOS, LINUX, MACOS, TVOS, WINDOWS,
-                                            EC2, VM, TYPE_CHOICES_DICT)
+                                            DESKTOP, EC2, MOBILE, SERVER, TABLET, VM, TYPE_CHOICES_DICT)
 from zentral.contrib.inventory.models import MetaMachine
 from zentral.utils.color import text_color_for_background_color
 
@@ -21,7 +21,7 @@ def base_inventory_tag(display_name, color):
     if color.upper() in ["FFFFFF", "FFF"]:
         style['border'] = '1px solid grey'
     style_str = ";".join(["%s:%s" % (key, val) for key, val in style.items()])
-    return mark_safe('<span class="label" style="%s">%s</span>' % (style_str, escape(display_name)))
+    return mark_safe('<span class="badge" style="%s">%s</span>' % (style_str, escape(display_name)))
 
 
 @register.simple_tag
@@ -33,17 +33,23 @@ def inventory_tag(tag):
 def base_machine_type_icon(machine_type):
     if machine_type not in TYPE_CHOICES_DICT:
         return ""
-    icon_class = "fas"
     icon = None
-    if machine_type == EC2:
-        icon_class = "fab"
-        icon = "aws"
+    if machine_type == DESKTOP:
+        icon = "pc-display"
+    elif machine_type == EC2:
+        icon = "amazon"
+    elif machine_type == MOBILE:
+        icon = "phone-fill"
+    elif machine_type == SERVER:
+        icon = "hdd-stack-fill"
+    elif machine_type == TABLET:
+        icon = "tablet-fill"
     elif machine_type == VM:
-        icon = "cube"
+        icon = "box"
     elif machine_type:
         icon = machine_type.lower()
     if icon:
-        return mark_safe(f'<i class="{icon_class} fa-{icon}"></i>')
+        return mark_safe(f'<i class="bi bi-{icon}"></i>')
     return ""
 
 
@@ -59,13 +65,13 @@ def base_machine_platform_icon(machine_platform):
     if machine_platform in {IOS, IPADOS, MACOS, TVOS}:
         icon = "apple"
     elif machine_platform == LINUX:
-        icon = "linux"
+        icon = "ubuntu"
     elif machine_platform == WINDOWS:
         icon = "windows"
     elif machine_platform == ANDROID:
         icon = "android"
     if icon:
-        return mark_safe('<i class="fab fa-{}" aria-hidden="true"></i>'.format(icon))
+        return mark_safe('<i class="bi bi-{}" aria-hidden="true"></i>'.format(icon))
     return ""
 
 
@@ -103,11 +109,11 @@ def extra_facts(extra_facts, autoescape=True):
         return mark_safe("")
     data = ""
     for key in sorted(extra_facts.keys()):
-        data += "<dt>{}</dt>\n".format(esc(key))
+        data += '<dt class="col-sm-3 text-md-end">{}</dt>\n'.format(esc(key))
         val = extra_facts[key]
         if isinstance(val, list):
             val_data = "<ul>\n{}</ul>\n".format(unordered_list(val, autoescape=autoescape))
         else:
             val_data = esc(val)
-        data += "<dd>\n{}\n</dd>\n".format(val_data)
+        data += '<dd class="col-sm-9">\n{}\n</dd>\n'.format(val_data)
     return mark_safe(data)

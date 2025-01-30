@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 from importlib import import_module
+import json
 import logging
 import pprint
 from django import template
@@ -7,12 +8,13 @@ from django.template.defaultfilters import stringfilter
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.functional import SimpleLazyObject
+from django.utils.html import escape
 from django.utils.safestring import mark_safe
 from pygments import lexers, highlight
 from pygments.formatters import HtmlFormatter
 from django.conf import settings
-from zentral.utils.terraform import make_terraform_quoted_str
 from zentral.utils.time import duration_repr as _duration_repr
+from zentral.core.incidents.models import Incident
 
 register = template.Library()
 
@@ -38,8 +40,6 @@ class MenuConfig:
                 title,
                 {'title': title,
                  'link_list': [],
-                 # TODO Legacy. Only used for the creation links for the probes, set with a context processor
-                 'extra_links_context_keys': menu_cfg.get("extra_context_links", []),
                  'weight': menu_cfg.get('weight', 1000)}
             )
             for item in menu_cfg['items']:
@@ -62,22 +62,6 @@ class MenuConfig:
     @staticmethod
     def _iter_section_links(context, section):
         yield from section["link_list"]
-        # TODO Legacy. Only used for the creation links for the probes, set with a context processor
-        extra_links_context_keys = section['extra_links_context_keys']
-        if extra_links_context_keys:
-            if "_cached_extra_context_links" not in section:
-                cached_extra_context_links = section.setdefault("_cached_extra_context_links", [])
-                for context_key in section.get('extra_links_context_keys', []):
-                    for subsection, subsection_links in context.get(context_key, {}).items():
-                        cached_extra_context_links.append((None, subsection.title(), False, None))
-                        for link_d in subsection_links:
-                            cached_extra_context_links.append((
-                                str(link_d["url"]), link_d["anchor_text"],
-                                link_d.get("local_user", False),
-                                link_d.get("permissions")
-                            ))
-                section["_cached_extra_context_links"] = cached_extra_context_links
-            yield from section["_cached_extra_context_links"]
 
     def get_filtered_sections(self, context):
         request = context.get("request")
@@ -127,21 +111,21 @@ class MenuConfig:
         return active, filtered_sections
 
 
-setup_menu_config = SimpleLazyObject(lambda: MenuConfig("setup_menu_cfg"))
+modules_menu_config = SimpleLazyObject(lambda: MenuConfig("modules_menu_cfg"))
 
 
-@register.inclusion_tag('_setup_dropdown.html', takes_context=True)
-def setup_dropdown(context):
-    context["active"], context["section_list"] = setup_menu_config.get_filtered_sections(context)
+@register.inclusion_tag('_modules_menu.html', takes_context=True)
+def modules_menu(context):
+    context["active"], context["section_list"] = modules_menu_config.get_filtered_sections(context)
     return context
 
 
-main_menu_config = SimpleLazyObject(lambda: MenuConfig("main_menu_cfg"))
+pinned_menu_config = SimpleLazyObject(lambda: MenuConfig("pinned_menu_cfg"))
 
 
-@register.inclusion_tag('_main_menu_app_dropdowns.html', takes_context=True)
-def main_menu_app_dropdowns(context):
-    _, context["dropdown_list"] = main_menu_config.get_filtered_sections(context)
+@register.inclusion_tag('_modules_menu.html', takes_context=True)
+def pinned_menu(context):
+    context["active"], context["section_list"] = pinned_menu_config.get_filtered_sections(context)
     return context
 
 
@@ -151,6 +135,44 @@ def pythonprettyprint(val):
     lexer = lexers.get_lexer_by_name('python')
     formatter = HtmlFormatter()
     return mark_safe(highlight(s, lexer, formatter))
+
+
+@register.filter()
+def jsonprettyprint(val):
+    s = json.dumps(val, indent=2)
+    lexer = lexers.get_lexer_by_name('json')
+    formatter = HtmlFormatter()
+    return mark_safe(highlight(s, lexer, formatter))
+
+
+@register.tag(name="codeexample")
+def do_code_example(parser, token):
+    try:
+        tag_name, lexer_name = token.split_contents()
+    except ValueError:
+        raise template.TemplateSyntaxError(
+            "%r tag requires a single argument, the lexer name" % token.contents.split()[0]
+        )
+    if not (lexer_name[0] == lexer_name[-1] and lexer_name[0] in ('"', "'")):
+        raise template.TemplateSyntaxError(
+            "%r tag's argument should be in quotes" % tag_name
+        )
+    lexer_name = lexer_name.strip("'").strip('"')
+    nodelist = parser.parse(("endcodeexample",))
+    parser.delete_first_token()
+    return CodeExampleNode(lexer_name, nodelist)
+
+
+class CodeExampleNode(template.Node):
+    def __init__(self, lexer_name, nodelist):
+        self.lexer_name = lexer_name
+        self.nodelist = nodelist
+
+    def render(self, context):
+        output = self.nodelist.render(context)
+        lexer = lexers.get_lexer_by_name(self.lexer_name)
+        formatter = HtmlFormatter(cssclass="highlight code-example")
+        return mark_safe(highlight(output, lexer, formatter))
 
 
 @register.filter()
@@ -188,7 +210,12 @@ def duration_repr(val):
         return "-"
 
 
-@register.filter(is_safe=True)
-@stringfilter
-def tf_quoted_str(val):
-    return make_terraform_quoted_str(val)
+@register.simple_tag
+def get_latest_open_incidents(latest=10):
+    return Incident().get_open(latest=latest)
+
+
+@register.filter()
+def privacywrapper(val):
+    escaped_val = escape(val)
+    return mark_safe(f'<span class="private-content">{escaped_val}</span>')

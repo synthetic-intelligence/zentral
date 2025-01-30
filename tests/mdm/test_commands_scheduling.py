@@ -3,17 +3,18 @@ from datetime import datetime
 from django.test import TestCase
 from django.utils.crypto import get_random_string
 from zentral.contrib.inventory.models import MetaBusinessUnit
-from zentral.contrib.mdm.models import (
-    Blueprint,
-    Channel,
-    CommandStatus,
-    RequestStatus,
-    EnrolledUser,
-)
+from zentral.contrib.mdm.artifacts import Target
 from zentral.contrib.mdm.commands import DeviceInformation
 from zentral.contrib.mdm.commands.scheduling import (
     _get_next_queued_command,
-    _update_inventory,
+    _update_base_inventory,
+    _update_extra_inventory,
+)
+from zentral.contrib.mdm.models import (
+    Blueprint,
+    Command,
+    RequestStatus,
+    EnrolledUser,
 )
 from .utils import force_dep_enrollment_session
 
@@ -43,11 +44,9 @@ class TestMDMCommandsScheduling(TestCase):
     def test_no_next_queues_command(self):
         self.assertIsNone(
             _get_next_queued_command(
-                Channel.Device,
-                RequestStatus.Idle,
+                Target(self.enrolled_device),
                 self.dep_enrollment_session,
-                self.enrolled_device,
-                None,
+                RequestStatus.IDLE,
             )
         )
 
@@ -57,11 +56,9 @@ class TestMDMCommandsScheduling(TestCase):
         self.assertIsNotNone(command.db_command.time)
         self.assertIsNone(
             _get_next_queued_command(
-                Channel.Device,
-                RequestStatus.Idle,
+                Target(self.enrolled_device),
                 self.dep_enrollment_session,
-                self.enrolled_device,
-                None,
+                RequestStatus.IDLE,
             )
         )
 
@@ -69,70 +66,77 @@ class TestMDMCommandsScheduling(TestCase):
         command = DeviceInformation.create_for_device(self.enrolled_device, queue=True)
         self.assertIsNone(command.db_command.time)
         fetched_command = _get_next_queued_command(
-            Channel.Device,
-            RequestStatus.Idle,
+            Target(self.enrolled_device),
             self.dep_enrollment_session,
-            self.enrolled_device,
-            None,
+            RequestStatus.IDLE,
         )
         self.assertEqual(command, fetched_command)
         self.assertIsNone(
             _get_next_queued_command(
-                Channel.Device,
-                RequestStatus.Idle,
+                Target(self.enrolled_device),
                 self.dep_enrollment_session,
-                self.enrolled_device,
-                None,
+                RequestStatus.IDLE,
             )
         )
 
     def test_not_now_device_information_rescheduled(self):
         cmd = DeviceInformation.create_for_device(self.enrolled_device)
-        cmd.db_command.status = CommandStatus.NotNow.value
+        cmd.db_command.status = Command.Status.NOT_NOW
         cmd.db_command.save()
         cmd2 = _get_next_queued_command(
-            Channel.Device,
-            RequestStatus.Idle,
+            Target(self.enrolled_device),
             self.dep_enrollment_session,
-            self.enrolled_device,
-            None,
+            RequestStatus.IDLE,
         )
         self.assertEqual(cmd, cmd2)
 
     # update inventory
 
-    def test_update_inventory_not_now_noop(self):
+    def test_update_base_inventory_not_now_noop(self):
         self.assertIsNone(
-            _update_inventory(
-                Channel.Device,
-                RequestStatus.NotNow,
+            _update_base_inventory(
+                Target(self.enrolled_device),
                 self.dep_enrollment_session,
-                self.enrolled_device,
-                None,
+                RequestStatus.NOT_NOW,
             )
         )
 
-    def test_update_inventory_user_channel_noop(self):
+    def test_update_extra_inventory_not_now_noop(self):
+        self.assertIsNone(
+            _update_extra_inventory(
+                Target(self.enrolled_device),
+                self.dep_enrollment_session,
+                RequestStatus.NOT_NOW,
+            )
+        )
+
+    def test_update_base_inventory_user_channel_noop(self):
         self.assertIsNotNone(self.enrolled_device.blueprint)
         self.assertIsNone(
-            _update_inventory(
-                Channel.User,
-                RequestStatus.Idle,
+            _update_base_inventory(
+                Target(self.enrolled_device, self.enrolled_user),
                 self.dep_enrollment_session,
-                self.enrolled_device,
-                self.enrolled_user,
+                RequestStatus.IDLE,
             )
         )
 
-    def test_update_inventory_no_blueprint_noop(self):
+    def test_update_extra_inventory_user_channel_noop(self):
+        self.assertIsNotNone(self.enrolled_device.blueprint)
+        self.assertIsNone(
+            _update_extra_inventory(
+                Target(self.enrolled_device, self.enrolled_user),
+                self.dep_enrollment_session,
+                RequestStatus.IDLE,
+            )
+        )
+
+    def test_update_extra_inventory_no_blueprint_noop(self):
         self.enrolled_device.blueprint = None
         self.assertIsNone(
-            _update_inventory(
-                Channel.Device,
-                RequestStatus.Idle,
+            _update_extra_inventory(
+                Target(self.enrolled_device),
                 self.dep_enrollment_session,
-                self.enrolled_device,
-                None,
+                RequestStatus.IDLE,
             )
         )
 
@@ -152,11 +156,16 @@ class TestMDMCommandsScheduling(TestCase):
         self.enrolled_device.certificates_updated_at = datetime.utcnow()
         self.enrolled_device.profiles_updated_at = datetime.utcnow()
         self.assertIsNone(
-            _update_inventory(
-                Channel.Device,
-                RequestStatus.Idle,
+            _update_base_inventory(
+                Target(self.enrolled_device),
                 self.dep_enrollment_session,
-                self.enrolled_device,
-                None,
+                RequestStatus.IDLE,
+            )
+        )
+        self.assertIsNone(
+            _update_extra_inventory(
+                Target(self.enrolled_device),
+                self.dep_enrollment_session,
+                RequestStatus.IDLE,
             )
         )

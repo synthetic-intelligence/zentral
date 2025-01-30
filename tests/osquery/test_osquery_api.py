@@ -2,9 +2,8 @@ from datetime import datetime
 import json
 from unittest.mock import patch
 import uuid
-from django.urls import reverse
 from django.test import TestCase, override_settings
-from django.urls import NoReverseMatch
+from django.urls import reverse, NoReverseMatch
 from django.utils.crypto import get_random_string
 from django.utils.text import slugify
 from server.urls import build_urlpatterns_for_zentral_apps
@@ -191,13 +190,18 @@ class OsqueryAPIViewsTestCase(TestCase):
         force_pack=False,
         force_compliance_check=False,
         force_distributed_query=False,
+        force_tag=False,
         event_routing_key=None
     ):
         if force_compliance_check:
             sql = "select 'OK' as ztl_status;"
         else:
             sql = "select 1 from processes;"
-        query = Query.objects.create(name=get_random_string(12), sql=sql)
+        if force_tag:
+            tag = Tag.objects.create(name=get_random_string(12))
+        else:
+            tag = None
+        query = Query.objects.create(name=get_random_string(12), sql=sql, tag=tag)
         pack = None
         if force_pack:
             pack_name = get_random_string(12)
@@ -229,11 +233,14 @@ class OsqueryAPIViewsTestCase(TestCase):
         missing_windows_build_data=False,
         unknown_windows_build=False,
         macos_os_version_name=None,
+        macos_os_version_empty_patch=False,
     ):
         if platform == "macos":
             qs = [d.copy() for d in INVENTORY_QUERY_SNAPSHOT]
             if macos_os_version_name is not None:
                 qs[0]["name"] = macos_os_version_name
+            if macos_os_version_empty_patch:
+                qs[0]["patch"] = ""
         elif platform == "windows":
             qs = [d.copy() for d in WIN_INVENTORY_QUERY_SNAPSHOT]
             if no_windows_build_data:
@@ -405,17 +412,17 @@ class OsqueryAPIViewsTestCase(TestCase):
         self.assertContains(response, '{"node_invalid": true}', status_code=200)
 
     def test_config_ok(self):
-        tag = Tag.objects.create(name=get_random_string())
+        tag = Tag.objects.create(name=get_random_string(12))
         query1, pack1, _ = self.force_query(force_pack=True)
         pack_query1 = pack1.packquery_set.get(query=query1)
         cp1 = ConfigurationPack.objects.create(configuration=self.configuration, pack=pack1)
         cp1.tags.add(tag)
-        event_routing_key = get_random_string()
+        event_routing_key = get_random_string(12)
         query2, pack2, _ = self.force_query(force_pack=True, event_routing_key=event_routing_key)
         pack_query2 = pack2.packquery_set.get(query=query2)
         ConfigurationPack.objects.create(configuration=self.configuration, pack=pack2)
         _, pack3, _ = self.force_query(force_pack=True, event_routing_key=event_routing_key)
-        tag2 = Tag.objects.create(name=get_random_string())
+        tag2 = Tag.objects.create(name=get_random_string(12))
         cp3 = ConfigurationPack.objects.create(configuration=self.configuration, pack=pack3)
         cp3.tags.add(tag2)
         em = self.force_enrolled_machine()
@@ -430,7 +437,7 @@ class OsqueryAPIViewsTestCase(TestCase):
             json_response["packs"],
             {f'{pack1.slug}/{pack1.pk}': {
                 'queries': {
-                    f'{pack_query1.slug}/{query1.pk}/1': {
+                    f'{pack_query1.slug}/std/{query1.pk}/1/': {
                         'interval': 12983,
                         'query': 'select 1 from processes;',
                         'removed': False}
@@ -438,23 +445,210 @@ class OsqueryAPIViewsTestCase(TestCase):
              },
              f'{pack2.slug}/{pack2.pk}': {
                 'queries': {
-                    f'{pack_query2.slug}/{query2.pk}/1/{event_routing_key}': {
+                    f'{pack_query2.slug}/std/{query2.pk}/1/{event_routing_key}': {
                         'interval': 12983,
                         'query': 'select 1 from processes;',
                         'removed': False}}}}
+        )
+
+    def test_config_disable_carver_true_str(self):
+        self.configuration.options = {"disable_carver": "true"}
+        self.configuration.save()
+        self.assertEqual(
+            self.configuration.get_all_flags(),
+            {'config_plugin': 'tls',
+             'config_refresh': 1200,
+             'config_tls_endpoint': '/public/osquery/config',
+             'disable_carver': 'true',
+             'disable_distributed': False,
+             'disable_enrollment': False,
+             'distributed_interval': 60,
+             'distributed_plugin': 'tls',
+             'distributed_tls_read_endpoint': '/public/osquery/distributed/read',
+             'distributed_tls_write_endpoint': '/public/osquery/distributed/write',
+             'enroll_tls_endpoint': '/public/osquery/enroll',
+             'logger_plugin': 'tls',
+             'logger_tls_compress': True,
+             'logger_tls_endpoint': '/public/osquery/log',
+             'logger_tls_period': 60,
+             'pack_delimiter': '/',
+             'tls_hostname': 'zentral'}
+        )
+        em = self.force_enrolled_machine()
+        response = self.post_as_json("config", {"node_key": em.node_key})
+        config = response.json()
+        # carve options are cli only flags
+        self.assertEqual(
+            config["options"],
+            {'disable_distributed': False,
+             'distributed_interval': 60,
+             'distributed_plugin': 'tls',
+             'distributed_tls_read_endpoint': '/public/osquery/distributed/read',
+             'distributed_tls_write_endpoint': '/public/osquery/distributed/write',
+             'logger_tls_compress': True,
+             'logger_tls_endpoint': '/public/osquery/log',
+             'logger_tls_period': 60,
+             'pack_delimiter': '/'}
+        )
+
+    def test_config_carver_disable_function_true_bool(self):
+        self.configuration.options = {"carver_disable_function": True}
+        self.configuration.save()
+        self.assertEqual(
+            self.configuration.get_all_flags(),
+            {'carver_disable_function': True,
+             'config_plugin': 'tls',
+             'config_refresh': 1200,
+             'config_tls_endpoint': '/public/osquery/config',
+             'disable_distributed': False,
+             'disable_enrollment': False,
+             'distributed_interval': 60,
+             'distributed_plugin': 'tls',
+             'distributed_tls_read_endpoint': '/public/osquery/distributed/read',
+             'distributed_tls_write_endpoint': '/public/osquery/distributed/write',
+             'enroll_tls_endpoint': '/public/osquery/enroll',
+             'logger_plugin': 'tls',
+             'logger_tls_compress': True,
+             'logger_tls_endpoint': '/public/osquery/log',
+             'logger_tls_period': 60,
+             'pack_delimiter': '/',
+             'tls_hostname': 'zentral'}
+        )
+        em = self.force_enrolled_machine()
+        response = self.post_as_json("config", {"node_key": em.node_key})
+        config = response.json()
+        # carve options are cli only flags
+        self.assertEqual(
+            config["options"],
+            {'disable_distributed': False,
+             'distributed_interval': 60,
+             'distributed_plugin': 'tls',
+             'distributed_tls_read_endpoint': '/public/osquery/distributed/read',
+             'distributed_tls_write_endpoint': '/public/osquery/distributed/write',
+             'logger_tls_compress': True,
+             'logger_tls_endpoint': '/public/osquery/log',
+             'logger_tls_period': 60,
+             'pack_delimiter': '/'}
+        )
+
+    def test_config_disable_carver_false_bool(self):
+        self.configuration.options = {"disable_carver": False}
+        self.configuration.save()
+        self.assertEqual(
+            self.configuration.get_all_flags(),
+            {'carver_compression': False,
+             'carver_continue_endpoint': '/public/osquery/carver/continue',
+             'carver_disable_function': False,
+             'carver_start_endpoint': '/public/osquery/carver/start',
+             'config_plugin': 'tls',
+             'config_refresh': 1200,
+             'config_tls_endpoint': '/public/osquery/config',
+             'disable_carver': False,
+             'disable_distributed': False,
+             'disable_enrollment': False,
+             'distributed_interval': 60,
+             'distributed_plugin': 'tls',
+             'distributed_tls_read_endpoint': '/public/osquery/distributed/read',
+             'distributed_tls_write_endpoint': '/public/osquery/distributed/write',
+             'enroll_tls_endpoint': '/public/osquery/enroll',
+             'logger_plugin': 'tls',
+             'logger_tls_compress': True,
+             'logger_tls_endpoint': '/public/osquery/log',
+             'logger_tls_period': 60,
+             'pack_delimiter': '/',
+             'tls_hostname': 'zentral'}
+        )
+        em = self.force_enrolled_machine()
+        response = self.post_as_json("config", {"node_key": em.node_key})
+        config = response.json()
+        # carve options are cli only flags
+        self.assertEqual(
+            config["options"],
+            {'disable_distributed': False,
+             'distributed_interval': 60,
+             'distributed_plugin': 'tls',
+             'distributed_tls_read_endpoint': '/public/osquery/distributed/read',
+             'distributed_tls_write_endpoint': '/public/osquery/distributed/write',
+             'logger_tls_compress': True,
+             'logger_tls_endpoint': '/public/osquery/log',
+             'logger_tls_period': 60,
+             'pack_delimiter': '/'}
+        )
+
+    def test_config_disable_carver_false_str(self):
+        self.configuration.options = {"disable_carver": "FaLse"}
+        self.configuration.save()
+        self.assertEqual(
+            self.configuration.get_all_flags(),
+            {'carver_compression': False,
+             'carver_continue_endpoint': '/public/osquery/carver/continue',
+             'carver_disable_function': False,
+             'carver_start_endpoint': '/public/osquery/carver/start',
+             'config_plugin': 'tls',
+             'config_refresh': 1200,
+             'config_tls_endpoint': '/public/osquery/config',
+             'disable_carver': False,
+             'disable_distributed': False,
+             'disable_enrollment': False,
+             'distributed_interval': 60,
+             'distributed_plugin': 'tls',
+             'distributed_tls_read_endpoint': '/public/osquery/distributed/read',
+             'distributed_tls_write_endpoint': '/public/osquery/distributed/write',
+             'enroll_tls_endpoint': '/public/osquery/enroll',
+             'logger_plugin': 'tls',
+             'logger_tls_compress': True,
+             'logger_tls_endpoint': '/public/osquery/log',
+             'logger_tls_period': 60,
+             'pack_delimiter': '/',
+             'tls_hostname': 'zentral'}
+        )
+        em = self.force_enrolled_machine()
+        response = self.post_as_json("config", {"node_key": em.node_key})
+        config = response.json()
+        # carve options are cli only flags
+        self.assertEqual(
+            config["options"],
+            {'disable_distributed': False,
+             'distributed_interval': 60,
+             'distributed_plugin': 'tls',
+             'distributed_tls_read_endpoint': '/public/osquery/distributed/read',
+             'distributed_tls_write_endpoint': '/public/osquery/distributed/write',
+             'logger_tls_compress': True,
+             'logger_tls_endpoint': '/public/osquery/log',
+             'logger_tls_period': 60,
+             'pack_delimiter': '/'}
         )
 
     def test_os_version_with_build_numbers_cleanup(self):
         tree = {}
         snapshot = self.get_default_inventory_query_snapshot("macos")
         update_tree_with_inventory_query_snapshot(tree, snapshot)
-        self.assertEqual(tree["os_version"]["major"], 10)
+        self.assertEqual(
+            tree["os_version"],
+            {'build': '19H1824', 'major': 10, 'minor': 15, 'name': 'macOS', 'patch': 7}
+        )
 
     def test_os_version_numbers_cleanup(self):
         tree = {}
         snapshot = self.get_default_inventory_query_snapshot("macos", macos_os_version_name="macOS")
         update_tree_with_inventory_query_snapshot(tree, snapshot)
-        self.assertEqual(tree["os_version"]["major"], 10)
+        self.assertEqual(
+            tree["os_version"],
+            {'build': '19H1824', 'major': 10, 'minor': 15, 'name': 'macOS', 'patch': 7}
+        )
+
+    def test_os_version_numbers_empty_patch(self):
+        tree = {}
+        snapshot = self.get_default_inventory_query_snapshot(
+            "macos",
+            macos_os_version_name="macOS",
+            macos_os_version_empty_patch=True
+        )
+        update_tree_with_inventory_query_snapshot(tree, snapshot)
+        self.assertEqual(
+            tree["os_version"],
+            {'build': '19H1824', 'major': 10, 'minor': 15, 'name': 'macOS', 'patch': 0}
+        )
 
     def test_osx_app_instance_schedule(self):
         em = self.force_enrolled_machine()
@@ -708,9 +902,27 @@ class OsqueryAPIViewsTestCase(TestCase):
                                       "queries": {str(dqm1.pk): [{"ztl_status": Status.OK.name}],
                                                   str(dqm2.pk): [{"username": "godzilla"}]},
                                       "statuses": {str(dqm1.pk): 0,
-                                                   str(dqm2.pk): 0}})
+                                                   str(dqm2.pk): 0},
+                                      "stats": {str(dqm1.pk): {'memory': 0,
+                                                               'system_time': 1,
+                                                               'user_time': 2,
+                                                               'wall_time_ms': 3},
+                                                str(dqm2.pk): {'memory': "haha",  # cannot be converted to an int
+                                                               'system_time': 2.3,  # a float
+                                                               # 'user_time': missing
+                                                               'wall_time_ms': 4}}})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {})
+        dqm1.refresh_from_db()
+        self.assertEqual(dqm1.memory, 0)
+        self.assertEqual(dqm1.system_time, 1)
+        self.assertEqual(dqm1.user_time, 2)
+        self.assertEqual(dqm1.wall_time_ms, 3)
+        dqm2.refresh_from_db()
+        self.assertIsNone(dqm2.memory)
+        self.assertEqual(dqm2.system_time, 2)
+        self.assertIsNone(dqm2.user_time)
+        self.assertEqual(dqm2.wall_time_ms, 4)
         ms_qs = MachineStatus.objects.filter(serial_number=em.serial_number, compliance_check=query1.compliance_check)
         self.assertEqual(ms_qs.count(), 1)
         ms = ms_qs.first()
@@ -751,8 +963,56 @@ class OsqueryAPIViewsTestCase(TestCase):
                                                    str(dqm2.pk): 0}})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {})
-        ms_qs = MachineStatus.objects.filter(serial_number=em.serial_number, compliance_check=query1.compliance_check)
-        self.assertEqual(ms_qs.count(), 0)  # distributed query version < query version
+        events = list(call_args.args[0] for call_args in post_event.call_args_list)
+        self.assertEqual(len(events), 1)
+        request_event = events[0]
+        self.assertIsInstance(request_event, OsqueryRequestEvent)
+        self.assertEqual(request_event.payload["request_type"], "distributed_write")
+
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_distributed_write_two_distributed_queries_add_one_tag(self, post_event):
+        query1, _, distributed_query1 = self.force_query(force_distributed_query=True, force_tag=True)
+        query2, _, distributed_query2 = self.force_query(force_distributed_query=True, force_tag=False)
+        em = self.force_enrolled_machine()
+        self.assertEqual(MachineTag.objects.filter(tag=query1.tag, serial_number=em.serial_number).count(), 0)
+        dqm1 = DistributedQueryMachine.objects.create(distributed_query=distributed_query1,
+                                                      serial_number=em.serial_number)
+        dqm2 = DistributedQueryMachine.objects.create(distributed_query=distributed_query2,
+                                                      serial_number=em.serial_number)
+        response = self.post_as_json("distributed_write",
+                                     {"node_key": em.node_key,
+                                      "queries": {str(dqm1.pk): [{"yolo": "fomo"}],
+                                                  str(dqm2.pk): [{"username": "godzilla"}]},
+                                      "statuses": {str(dqm1.pk): 0,
+                                                   str(dqm2.pk): 0}})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {})
+        self.assertEqual(MachineTag.objects.filter(tag=query1.tag, serial_number=em.serial_number).count(), 1)
+        events = list(call_args.args[0] for call_args in post_event.call_args_list)
+        self.assertEqual(len(events), 1)
+        request_event = events[0]
+        self.assertIsInstance(request_event, OsqueryRequestEvent)
+        self.assertEqual(request_event.payload["request_type"], "distributed_write")
+
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_distributed_write_two_distributed_queries_remove_one_tag(self, post_event):
+        query1, _, distributed_query1 = self.force_query(force_distributed_query=True, force_tag=True)
+        query2, _, distributed_query2 = self.force_query(force_distributed_query=True, force_tag=False)
+        em = self.force_enrolled_machine()
+        MachineTag.objects.create(tag=query1.tag, serial_number=em.serial_number)
+        dqm1 = DistributedQueryMachine.objects.create(distributed_query=distributed_query1,
+                                                      serial_number=em.serial_number)
+        dqm2 = DistributedQueryMachine.objects.create(distributed_query=distributed_query2,
+                                                      serial_number=em.serial_number)
+        response = self.post_as_json("distributed_write",
+                                     {"node_key": em.node_key,
+                                      "queries": {str(dqm1.pk): [],
+                                                  str(dqm2.pk): [{"username": "godzilla"}]},
+                                      "statuses": {str(dqm1.pk): 0,
+                                                   str(dqm2.pk): 0}})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {})
+        self.assertEqual(MachineTag.objects.filter(tag=query1.tag, serial_number=em.serial_number).count(), 0)
         events = list(call_args.args[0] for call_args in post_event.call_args_list)
         self.assertEqual(len(events), 1)
         request_event = events[0]
@@ -914,7 +1174,8 @@ class OsqueryAPIViewsTestCase(TestCase):
         json_response = response.json()
         self.assertEqual(json_response, {})
 
-    def test_log_added_result(self):
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_log_added_result(self, post_event):
         em = self.force_enrolled_machine()
         query, pack, _ = self.force_query(force_pack=True)
         post_data = {
@@ -931,11 +1192,84 @@ class OsqueryAPIViewsTestCase(TestCase):
         response = self.post_as_json("log", post_data)
         json_response = response.json()
         self.assertEqual(json_response, {})
+        events = list(call_args.args[0] for call_args in post_event.call_args_list)
+        self.assertEqual(len(events), 2)
+        request_event = events[0]
+        self.assertIsInstance(request_event, OsqueryRequestEvent)
+        self.assertEqual(request_event.payload["request_type"], "log")
+        result_event = events[1]
+        self.assertIsInstance(result_event, OsqueryResultEvent)
+        self.assertIsNone(result_event.metadata.routing_key)
+        self.assertEqual(result_event.get_linked_objects_keys(),
+                         {"osquery_pack": [(pack.pk,)],
+                          "osquery_query": [(query.pk,)]})
+
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_log_added_result_legacy_key(self, post_event):
+        em = self.force_enrolled_machine()
+        query, pack, _ = self.force_query(force_pack=True)
+        post_data = {
+            "node_key": em.node_key,
+            "log_type": "result",
+            "data": [
+                {'name': f"pack/{pack.slug}/{pack.pk}/{query.packquery.slug}/{query.pk}/{query.version}",
+                 'action': 'added',
+                 'hostIdentifier': 'godzilla.local',
+                 'columns': {'name': 'Dropbox', 'pid': '1234', 'port': '17500'},
+                 'unixTime': '1480605737'}
+            ]
+        }
+        response = self.post_as_json("log", post_data)
+        json_response = response.json()
+        self.assertEqual(json_response, {})
+        events = list(call_args.args[0] for call_args in post_event.call_args_list)
+        self.assertEqual(len(events), 2)
+        request_event = events[0]
+        self.assertIsInstance(request_event, OsqueryRequestEvent)
+        self.assertEqual(request_event.payload["request_type"], "log")
+        result_event = events[1]
+        self.assertIsInstance(result_event, OsqueryResultEvent)
+        self.assertIsNone(result_event.metadata.routing_key)
+        self.assertEqual(result_event.get_linked_objects_keys(),
+                         {"osquery_pack": [(pack.pk,)],
+                          "osquery_query": [(query.pk,)]})
+
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_log_added_result_legacy_key_with_routing_key(self, post_event):
+        em = self.force_enrolled_machine()
+        event_routing_key = get_random_string(12)
+        query, pack, _ = self.force_query(force_pack=True, event_routing_key=event_routing_key)
+        post_data = {
+            "node_key": em.node_key,
+            "log_type": "result",
+            "data": [
+                {'name': f"pack/{pack.slug}/{pack.pk}/{query.packquery.slug}/"
+                         f"{query.pk}/{query.version}/{event_routing_key}",
+                 'action': 'added',
+                 'hostIdentifier': 'godzilla.local',
+                 'columns': {'name': 'Dropbox', 'pid': '1234', 'port': '17500'},
+                 'unixTime': '1480605737'}
+            ]
+        }
+        response = self.post_as_json("log", post_data)
+        json_response = response.json()
+        self.assertEqual(json_response, {})
+        events = list(call_args.args[0] for call_args in post_event.call_args_list)
+        self.assertEqual(len(events), 2)
+        request_event = events[0]
+        self.assertIsInstance(request_event, OsqueryRequestEvent)
+        self.assertEqual(request_event.payload["request_type"], "log")
+        result_event = events[1]
+        self.assertIsInstance(result_event, OsqueryResultEvent)
+        self.assertEqual(result_event.metadata.routing_key, event_routing_key)
+        self.assertEqual(result_event.get_linked_objects_keys(),
+                         {"osquery_pack": [(pack.pk,)],
+                          "osquery_query": [(query.pk,)]})
 
     @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
     def test_log_added_result_with_carve(self, post_event):
         em = self.force_enrolled_machine()
-        event_routing_key = get_random_string()
+        event_routing_key = get_random_string(12)
         query, pack, _ = self.force_query(force_pack=True, event_routing_key=event_routing_key)
         carve_guid = uuid.uuid4()
         request_id = uuid.uuid4()
@@ -988,7 +1322,7 @@ class OsqueryAPIViewsTestCase(TestCase):
     @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
     def test_log_snapshot_result(self, post_event):
         em = self.force_enrolled_machine()
-        event_routing_key = get_random_string()
+        event_routing_key = get_random_string(12)
         query, pack, _ = self.force_query(force_pack=True, event_routing_key=event_routing_key)
         post_data = {
             "node_key": em.node_key,
@@ -1030,7 +1364,7 @@ class OsqueryAPIViewsTestCase(TestCase):
     @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
     def test_log_snapshot_result_with_carve(self, post_event):
         em = self.force_enrolled_machine()
-        event_routing_key = get_random_string()
+        event_routing_key = get_random_string(12)
         query, pack, _ = self.force_query(force_pack=True, event_routing_key=event_routing_key)
         carve_guid = uuid.uuid4()
         request_id = uuid.uuid4()
@@ -1086,7 +1420,7 @@ class OsqueryAPIViewsTestCase(TestCase):
         query1, pack1, _ = self.force_query(force_pack=True, force_compliance_check=True)
         status_time0 = datetime(2021, 12, 23)
         status_time1 = datetime(2021, 12, 24)
-        event_routing_key = get_random_string()
+        event_routing_key = get_random_string(12)
         query2, pack2, _ = self.force_query(
             force_pack=True,
             force_compliance_check=True,
@@ -1161,6 +1495,113 @@ class OsqueryAPIViewsTestCase(TestCase):
                                  {"compliance_check": [(query1.compliance_check.pk,)],
                                   "osquery_pack": [(pack1.pk,)],
                                   "osquery_query": [(query1.pk,)]})
+
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_log_snapshot_result_with_added_tag_check(self, post_event):
+        em = self.force_enrolled_machine()
+        query1, pack1, _ = self.force_query(force_pack=True, force_tag=True)
+        self.assertEqual(MachineTag.objects.filter(tag=query1.tag, serial_number=em.serial_number).count(), 0)
+        status_time0 = datetime(2021, 12, 23)
+        status_time1 = datetime(2021, 12, 24)
+        post_data = {
+            "node_key": em.node_key,
+            "log_type": "result",
+            "data": [
+                {'name': Pack.DELIMITER.join(['pack', pack1.configuration_key(), query1.packquery.pack_key()]),
+                 'action': 'snapshot',
+                 'hostIdentifier': 'godzilla.local',
+                 "snapshot": [],
+                 "unixTime": status_time0.strftime('%s')},
+                {'name': Pack.DELIMITER.join(['pack', pack1.configuration_key(), query1.packquery.pack_key()]),
+                 'action': 'snapshot',
+                 'hostIdentifier': 'godzilla.local',
+                 "snapshot": [{"yolo": "fomo"}],
+                 "unixTime": status_time1.strftime('%s')},
+            ]
+        }
+        response = self.post_as_json("log", post_data)
+        json_response = response.json()
+        self.assertEqual(json_response, {})
+        self.assertEqual(MachineTag.objects.filter(tag=query1.tag, serial_number=em.serial_number).count(), 1)
+        events = list(call_args.args[0] for call_args in post_event.call_args_list)
+        self.assertEqual(len(events), 3)
+        request_event = events[0]
+        self.assertIsInstance(request_event, OsqueryRequestEvent)
+        self.assertEqual(request_event.payload["request_type"], "log")
+        for event_idx, result_event in enumerate(events[1:]):
+            self.assertIsInstance(result_event, OsqueryResultEvent)
+
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_log_snapshot_result_with_query_outdated_no_added_tag_check(self, post_event):
+        em = self.force_enrolled_machine()
+        query1, pack1, _ = self.force_query(force_pack=True, force_tag=True)
+        self.assertEqual(MachineTag.objects.filter(tag=query1.tag, serial_number=em.serial_number).count(), 0)
+        status_time0 = datetime(2021, 12, 23)
+        status_time1 = datetime(2021, 12, 24)
+        post_data = {
+            "node_key": em.node_key,
+            "log_type": "result",
+            "data": [
+                {'name': Pack.DELIMITER.join(['pack', pack1.configuration_key(), query1.packquery.pack_key()]),
+                 'action': 'snapshot',
+                 'hostIdentifier': 'godzilla.local',
+                 "snapshot": [],
+                 "unixTime": status_time0.strftime('%s')},
+                {'name': Pack.DELIMITER.join(['pack', pack1.configuration_key(), query1.packquery.pack_key()]),
+                 'action': 'snapshot',
+                 'hostIdentifier': 'godzilla.local',
+                 "snapshot": [{"yolo": "fomo"}],
+                 "unixTime": status_time1.strftime('%s')},
+            ]
+        }
+        query1.version = 147
+        query1.save()
+        response = self.post_as_json("log", post_data)
+        json_response = response.json()
+        self.assertEqual(json_response, {})
+        self.assertEqual(MachineTag.objects.filter(tag=query1.tag, serial_number=em.serial_number).count(), 0)
+        events = list(call_args.args[0] for call_args in post_event.call_args_list)
+        self.assertEqual(len(events), 3)
+        request_event = events[0]
+        self.assertIsInstance(request_event, OsqueryRequestEvent)
+        self.assertEqual(request_event.payload["request_type"], "log")
+        for event_idx, result_event in enumerate(events[1:]):
+            self.assertIsInstance(result_event, OsqueryResultEvent)
+
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_log_snapshot_result_with_removed_tag_check(self, post_event):
+        em = self.force_enrolled_machine()
+        query1, pack1, _ = self.force_query(force_pack=True, force_tag=True)
+        MachineTag.objects.create(tag=query1.tag, serial_number=em.serial_number)
+        status_time0 = datetime(2021, 12, 23)
+        status_time1 = datetime(2021, 12, 24)
+        post_data = {
+            "node_key": em.node_key,
+            "log_type": "result",
+            "data": [
+                {'name': Pack.DELIMITER.join(['pack', pack1.configuration_key(), query1.packquery.pack_key()]),
+                 'action': 'snapshot',
+                 'hostIdentifier': 'godzilla.local',
+                 "snapshot": [],
+                 "unixTime": status_time1.strftime('%s')},
+                {'name': Pack.DELIMITER.join(['pack', pack1.configuration_key(), query1.packquery.pack_key()]),
+                 'action': 'snapshot',
+                 'hostIdentifier': 'godzilla.local',
+                 "snapshot": [{"yolo": "fomo"}],
+                 "unixTime": status_time0.strftime('%s')},
+            ]
+        }
+        response = self.post_as_json("log", post_data)
+        json_response = response.json()
+        self.assertEqual(json_response, {})
+        self.assertEqual(MachineTag.objects.filter(tag=query1.tag, serial_number=em.serial_number).count(), 0)
+        events = list(call_args.args[0] for call_args in post_event.call_args_list)
+        self.assertEqual(len(events), 3)
+        request_event = events[0]
+        self.assertIsInstance(request_event, OsqueryRequestEvent)
+        self.assertEqual(request_event.payload["request_type"], "log")
+        for event_idx, result_event in enumerate(events[1:]):
+            self.assertIsInstance(result_event, OsqueryResultEvent)
 
     @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
     def test_start_file_carving(self, post_event):
@@ -1423,4 +1864,4 @@ class OsqueryAPIViewsTestCase(TestCase):
                 url_prefix + reverse(f"osquery_public_legacy:{route}", urlconf=urlpatterns_w_legacy)
             )
             with self.assertRaises(NoReverseMatch):
-                reverse("osquery_public:{route}", args=urlpatterns_wo_legacy)
+                reverse(f"osquery_public_legacy:{route}", urlconf=urlpatterns_wo_legacy)

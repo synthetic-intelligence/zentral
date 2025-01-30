@@ -20,6 +20,7 @@ from django.utils.functional import cached_property
 from django.utils.text import slugify
 from django.utils.timesince import timesince
 from django.utils.translation import gettext_lazy as _
+from realms.models import RealmUser
 from zentral.conf import settings
 from zentral.core.compliance_checks.utils import get_machine_compliance_check_statuses
 from zentral.core.incidents.models import MachineIncident, Status
@@ -93,9 +94,14 @@ class MetaBusinessUnit(models.Model):
         tags.sort(key=lambda t: (t.meta_business_unit is None, str(t).upper()))
         return tags
 
-    def serialize(self):
-        return {"name": self.name,
-                "pk": self.pk}
+    def serialize_for_event(self, keys_only=False):
+        d = {"pk": self.pk, "name": self.name}
+        if keys_only:
+            return d
+        d.update({"api_enrollment_enabled": self.api_enrollment_enabled(),
+                  "created_at": self.created_at,
+                  "updated_at": self.updated_at})
+        return d
 
     def can_be_deleted(self):
         for related_objects in find_all_related_objects(self):
@@ -495,6 +501,14 @@ class PrincipalUser(AbstractMTObject):
     principal_name = models.TextField(db_index=True)
     display_name = models.TextField(blank=True, null=True)
 
+    @cached_property
+    def realm_user(self):
+        if self.source.type == PrincipalUserSource.INVENTORY:
+            try:
+                return RealmUser.objects.get(pk=self.unique_id)
+            except RealmUser.DoesNotExist:
+                pass
+
 
 class Payload(AbstractMTObject):
     uuid = models.TextField()
@@ -792,6 +806,18 @@ class Taxonomy(models.Model):
                                       None))
         return link_list
 
+    def serialize_for_event(self, keys_only=False):
+        d = {"pk": self.pk, "name": self.name}
+        if keys_only:
+            return d
+        d.update({
+            "created_at": self.created_at,
+            "updated_at": self.updated_at
+        })
+        if self.meta_business_unit:
+            d["meta_business_unit"] = self.meta_business_unit.serialize_for_event(keys_only=True)
+        return d
+
 
 class TagManager(models.Manager):
     def available_for_meta_business_unit(self, meta_business_unit):
@@ -877,6 +903,20 @@ class Tag(models.Model):
                                                      related_objects.name),
                                       None))
         return link_list
+
+    def serialize_for_event(self, keys_only=False):
+        d = {"pk": self.pk, "name": self.name}
+        if keys_only:
+            return d
+        d.update({
+            "color": self.color,
+            "slug": self.slug
+        })
+        if self.meta_business_unit:
+            d["meta_business_unit"] = self.meta_business_unit.serialize_for_event(keys_only=True)
+        if self.taxonomy:
+            d["taxonomy"] = self.taxonomy.serialize_for_event(keys_only=True)
+        return d
 
 
 class MachineTag(models.Model):
@@ -1054,10 +1094,11 @@ class MetaMachine:
         tags.sort(key=lambda t: (t.meta_business_unit is None, str(t).upper()))
         return tags
 
-    def tag_names(self):
+    @cached_property
+    def tag_pks_and_names(self):
         # Optimized for only one SQL query
         query = (
-            "select name from inventory_tag where id in ("
+            "select id, name from inventory_tag where id in ("
             "  select tag_id from inventory_machinetag where serial_number = %s"
             "  union"
             "  select tag_id from inventory_metabusinessunittag as mbut"
@@ -1069,7 +1110,7 @@ class MetaMachine:
         )
         cursor = connection.cursor()
         cursor.execute(query, [self.serial_number, self.serial_number])
-        return sorted((t[0] for t in cursor.fetchall()), key=lambda n: n.lower())
+        return sorted(cursor.fetchall(), key=lambda t: t[1].lower())
 
     def update_taxonomy_tags(self, taxonomy, tag_names):
         tag_names = set(tag_names)
@@ -1178,7 +1219,8 @@ class MetaMachine:
             # os versions
             "select ms.src, 'os_version' as key,"
             "jsonb_build_object("
-            "  'name', osv.name, 'major', osv.major, 'minor', osv.minor, 'patch', osv.patch, 'build', osv.build"
+            "  'name', osv.name, 'major', osv.major, 'minor', osv.minor, 'patch', osv.patch, "
+            "  'build', osv.build, 'version', osv.version"
             ") "
             "from inventory_osversion as osv join ms on (ms.os_version_id = osv.id) "
 
@@ -1315,13 +1357,7 @@ class MetaMachine:
             if key == "system_info":
                 d["name"] = agg["computer_name"] or agg["hostname"]
             elif key == "os_version":
-                build = agg.get("build")
-                os_version_items = (
-                    agg.get("name"),
-                    ".".join(str(v) for v in (agg.get(k) for k in ('major', 'minor', 'patch')) if v is not None),
-                    f"({build})" if build else None
-                )
-                os_version_str = " ".join(s for s in os_version_items if s)
+                os_version_str = os_version_display(agg)
                 if os_version_str:
                     d[key] = os_version_str
             elif key in ("types", "platforms"):
@@ -1476,7 +1512,7 @@ class EnrollmentSecret(models.Model):
         if tags:
             d["tags"] = tags
         if self.meta_business_unit:
-            d["meta_business_unit"] = self.meta_business_unit.serialize()
+            d["meta_business_unit"] = self.meta_business_unit.serialize_for_event(keys_only=True)
         if self.serial_numbers:
             d["serial_numbers"] = self.serial_numbers
         if self.udids:
@@ -1601,7 +1637,9 @@ class File(AbstractMTObject):
     source = models.ForeignKey(Source, on_delete=models.PROTECT)
     name = models.TextField()
     path = models.TextField()
+    cdhash = models.CharField(max_length=40, blank=True, null=True, db_index=True)
     sha_256 = models.CharField(max_length=64, db_index=True)
+    signing_id = models.TextField(blank=True, null=True, db_index=True)
     bundle = models.ForeignKey(OSXApp, on_delete=models.PROTECT, blank=True, null=True)
     bundle_path = models.TextField(blank=True, null=True)
     signed_by = models.ForeignKey(Certificate, on_delete=models.PROTECT, blank=True, null=True)

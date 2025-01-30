@@ -46,9 +46,8 @@ class SetupLocationViewsTestCase(TestCase):
         self.client.force_login(self.user)
 
     def _force_location(self, server_token_hash=None, name=None):
-        location = Location(
+        location = Location.objects.create(
             server_token_hash=server_token_hash or get_random_string(40, allowed_chars='abcdef0123456789'),
-            server_token=get_random_string(12),
             server_token_expiration_date=datetime.date(2050, 1, 1),
             organization_name=get_random_string(12),
             country_code="DE",
@@ -58,6 +57,8 @@ class SetupLocationViewsTestCase(TestCase):
             website_url="https://business.apple.com",
             mdm_info_id=uuid.uuid4(),
         )
+        location.set_server_token(get_random_string(12))
+        location.save()
         server_token = location.set_notification_auth_token()
         location.save()
         return location, server_token
@@ -76,6 +77,15 @@ class SetupLocationViewsTestCase(TestCase):
         vppserver_token = BytesIO(content)
         vppserver_token.name = "test.vppserver_token"
         return vppserver_token, digest
+
+    # rewrap secrets
+
+    def test_rewrap_secrets(self):
+        location, _ = self._force_location()
+        server_token = location.get_server_token()
+        self.assertIsNotNone(server_token)
+        location.rewrap_secrets()
+        self.assertEqual(location.get_server_token(), server_token)
 
     # list server server_tokens
 
@@ -162,7 +172,7 @@ class SetupLocationViewsTestCase(TestCase):
                                     {"server_token_file": vppserver_token})
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "mdm/location_form.html")
-        self.assertFormError(response, "form", "server_token_file", "Not a valid server token")
+        self.assertFormError(response.context["form"], "server_token_file", "Not a valid server token")
 
     def test_create_location_post_hash_collision(self):
         vppserver_token, server_token_hash = self._build_vppserver_token(skip_org_name=True)
@@ -171,7 +181,7 @@ class SetupLocationViewsTestCase(TestCase):
         response = self.client.post(reverse("mdm:create_location"),
                                     {"server_token_file": vppserver_token})
         self.assertEqual(response.status_code, 200)
-        self.assertFormError(response, "form",
+        self.assertFormError(response.context["form"],
                              "server_token_file",
                              "A location with the same server token already exists.")
 
@@ -181,7 +191,7 @@ class SetupLocationViewsTestCase(TestCase):
         response = self.client.post(reverse("mdm:create_location"),
                                     {"server_token_file": vppserver_token})
         self.assertEqual(response.status_code, 200)
-        self.assertFormError(response, "form", "server_token_file", "Could not get organization name.")
+        self.assertFormError(response.context["form"], "server_token_file", "Could not get organization name.")
 
     @patch("zentral.contrib.mdm.forms.AppsBooksClient")
     def test_create_location_post_invalid_server_token(self, AppsBooksClient):
@@ -193,7 +203,7 @@ class SetupLocationViewsTestCase(TestCase):
         response = self.client.post(reverse("mdm:create_location"),
                                     {"server_token_file": vppserver_token})
         self.assertEqual(response.status_code, 200)
-        self.assertFormError(response, "form", "server_token_file", "Could not get client information")
+        self.assertFormError(response.context["form"], "server_token_file", "Could not get client information")
 
     @patch("zentral.contrib.mdm.forms.AppsBooksClient")
     def test_create_location_post_invalid_config(self, AppsBooksClient):
@@ -206,7 +216,7 @@ class SetupLocationViewsTestCase(TestCase):
                                     {"server_token_file": vppserver_token})
         self.assertEqual(response.status_code, 200)
         self.assertFormError(
-            response, "form", "server_token_file",
+            response.context["form"], "server_token_file",
             ['Missing or bad countryISO2ACode.',
              'Missing or bad uId.',
              'Missing or bad locationName.',
@@ -231,7 +241,7 @@ class SetupLocationViewsTestCase(TestCase):
         response = self.client.post(reverse("mdm:create_location"),
                                     {"server_token_file": vppserver_token})
         self.assertEqual(response.status_code, 200)
-        self.assertFormError(response, "form", "server_token_file", "Missing tokenExpirationDate.")
+        self.assertFormError(response.context["form"], "server_token_file", "Missing tokenExpirationDate.")
 
     @patch("zentral.contrib.mdm.forms.AppsBooksClient")
     def test_create_location_post_invalid_server_token_expiration_date(self, AppsBooksClient):
@@ -250,7 +260,8 @@ class SetupLocationViewsTestCase(TestCase):
         response = self.client.post(reverse("mdm:create_location"),
                                     {"server_token_file": vppserver_token})
         self.assertEqual(response.status_code, 200)
-        self.assertFormError(response, "form", "server_token_file", "Could not parse server token expiration date.")
+        self.assertFormError(response.context["form"],
+                             "server_token_file", "Could not parse server token expiration date.")
 
     @patch("zentral.contrib.mdm.forms.AppsBooksClient")
     def test_create_location_post(self, AppsBooksClient):
@@ -320,24 +331,24 @@ class SetupLocationViewsTestCase(TestCase):
 
     def test_notify_location_missing_header(self):
         location, _ = self._force_location()
-        response = self.client.post(reverse("mdm:notify_location", args=(location.mdm_info_id,)))
+        response = self.client.post(reverse("mdm_public:notify_location", args=(location.mdm_info_id,)))
         self.assertEqual(response.status_code, 403)
 
     def test_notify_location_bad_header(self):
         location, _ = self._force_location()
-        response = self.client.post(reverse("mdm:notify_location", args=(location.mdm_info_id,)),
+        response = self.client.post(reverse("mdm_public:notify_location", args=(location.mdm_info_id,)),
                                     HTTP_AUTHORIZATION="Malformed")
         self.assertEqual(response.status_code, 403)
 
     def test_notify_location_unknown(self):
         location, _ = self._force_location()
-        response = self.client.post(reverse("mdm:notify_location", args=(location.mdm_info_id,)),
+        response = self.client.post(reverse("mdm_public:notify_location", args=(location.mdm_info_id,)),
                                     HTTP_AUTHORIZATION="Bearer Unknown")
         self.assertEqual(response.status_code, 403)
 
     def test_notify_location_bad_payload(self):
         location, server_token = self._force_location()
-        response = self.client.post(reverse("mdm:notify_location", args=(location.mdm_info_id,)),
+        response = self.client.post(reverse("mdm_public:notify_location", args=(location.mdm_info_id,)),
                                     content_type="text/xml",
                                     data="",
                                     HTTP_AUTHORIZATION=f"Bearer {server_token}")
@@ -347,7 +358,7 @@ class SetupLocationViewsTestCase(TestCase):
     def test_notify_location(self, post_raw_event):
 
         location, server_token = self._force_location()
-        response = self.client.post(reverse("mdm:notify_location", args=(location.mdm_info_id,)),
+        response = self.client.post(reverse("mdm_public:notify_location", args=(location.mdm_info_id,)),
                                     content_type="application/json",
                                     data={"yolo": "un"},
                                     HTTP_AUTHORIZATION=f"Bearer {server_token}")

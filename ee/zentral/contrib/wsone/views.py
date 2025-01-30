@@ -1,10 +1,9 @@
-import base64
 import logging
 from urllib.parse import urlencode
 from django.contrib.auth.mixins import LoginRequiredMixin, PermissionRequiredMixin
 from django.core.exceptions import PermissionDenied
 from django.db import transaction
-from django.http import HttpResponse, HttpResponseRedirect
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.urls import reverse, reverse_lazy
 from django.utils.crypto import constant_time_compare
@@ -13,6 +12,7 @@ from django.views.generic.edit import CreateView, UpdateView, DeleteView
 from zentral.core.stores.conf import frontend_store, stores
 from zentral.core.stores.views import EventsView, FetchEventsView, EventsStoreRedirectView
 from zentral.utils.api_views import APIAuthError, JSONPostAPIView
+from zentral.utils.http import basic_auth_username_and_password_from_request
 from zentral.utils.text import encode_args
 from .events import (post_instance_created_event,
                      post_instance_deleted_event,
@@ -47,6 +47,15 @@ class IndexView(LoginRequiredMixin, TemplateView):
 class InstanceListView(PermissionRequiredMixin, ListView):
     permission_required = "wsone.view_instance"
     model = Instance
+
+    def get_context_data(self, **kwargs):
+        if not self.request.user.has_module_perms("wsone"):
+            raise PermissionDenied("Not allowed")
+        ctx = super().get_context_data(**kwargs)
+        instance_qs = Instance.objects.all()
+        ctx["instances"] = instance_qs
+        ctx["instance_count"] = instance_qs.count()
+        return ctx
 
 
 class CreateInstanceView(PermissionRequiredMixin, CreateView):
@@ -96,13 +105,11 @@ class DeleteInstanceView(PermissionRequiredMixin, DeleteView):
     model = Instance
     success_url = reverse_lazy("wsone:instances")
 
-    def delete(self, request, *args, **kwargs):
-        self.object = self.get_object()
+    def form_valid(self, form):
         serialized_instance = self.object.serialize_for_event()
-        success_url = self.get_success_url()
-        self.object.delete()
+        response = super().form_valid(form)
         transaction.on_commit(lambda: post_instance_deleted_event(serialized_instance, self.request))
-        return HttpResponseRedirect(success_url)
+        return response
 
 
 class EventsMixin:
@@ -147,19 +154,10 @@ class InstanceEventsStoreRedirectView(EventsMixin, EventsStoreRedirectView):
 
 class EventNotificationsView(JSONPostAPIView):
     def check_basic_auth(self):
-        auth_header = self.request.META.get("HTTP_AUTHORIZATION", None)
-        if not auth_header:
-            logger.error("Missing Authorization header", extra={'request': self.request})
-            raise APIAuthError
-        if isinstance(auth_header, str):
-            auth_header = auth_header.encode("utf-8")
         try:
-            scheme, params = auth_header.split()
-            assert scheme.lower() == b"basic"
-            decoded_params = base64.b64decode(params)
-            username, password = decoded_params.split(b":", 1)
-        except Exception:
-            logger.error("Invalid basic authentication header", extra={'request': self.request})
+            username, password = basic_auth_username_and_password_from_request(self.request)
+        except ValueError as e:
+            logger.exception("Authentication error: %s", e, extra={'request': self.request})
             raise APIAuthError
         self.instance = get_object_or_404(Instance, pk=self.kwargs["pk"])
         if (

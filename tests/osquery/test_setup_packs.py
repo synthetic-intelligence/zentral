@@ -1,4 +1,5 @@
 from functools import reduce
+from io import BytesIO
 import operator
 from django.contrib.auth.models import Group, Permission
 from django.db.models import Q
@@ -40,7 +41,8 @@ class OsquerySetupPacksViewsTestCase(TestCase):
         self.client.force_login(self.user)
 
     def _force_pack(self):
-        return Pack.objects.create(name=get_random_string(12))
+        name = get_random_string(12)
+        return Pack.objects.create(name=name, slug=name)
 
     def _force_query(self, query_name=None, force_pack=False, force_compliance_check=False):
         if query_name:
@@ -120,6 +122,88 @@ class OsquerySetupPacksViewsTestCase(TestCase):
         pack = response.context["object"]
         self.assertEqual(pack.name, new_name)
         self.assertEqual(pack.shard, 97)
+
+    # upload pack
+
+    def test_upload_pack_redirect(self):
+        pack = self._force_pack()
+        self._login_redirect(reverse("osquery:upload_pack", args=(pack.pk,)))
+
+    def test_upload_pack_permission_denied(self):
+        pack = self._force_pack()
+        self._login()
+        response = self.client.get(reverse("osquery:upload_pack", args=(pack.pk,)))
+        self.assertEqual(response.status_code, 403)
+
+    def test_upload_pack_get(self):
+        pack = self._force_pack()
+        self._login("osquery.change_pack")
+        response = self.client.get(reverse("osquery:upload_pack", args=(pack.pk,)))
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "osquery/pack_upload.html")
+
+    def test_upload_yaml_pack_post(self):
+        pack = self._force_pack()
+        self._login("osquery.change_pack", "osquery.view_pack", "osquery.view_packquery")
+        pack_file = BytesIO(
+            "---\n"
+            "# Do not use this query in production!!!\n\n"
+            'platform: "darwin"\n'
+            'queries:\n'
+            '  WireLurker:\n'
+            '    query: >-\n'
+            '      select * from launchd where\n'
+            "      name = 'com.apple.periodic-dd-mm-yy.plist';\n"
+            "    interval: 3600\n"
+            "    version: 1.4.5\n"
+            "    description: (https://github.com/PaloAltoNetworks-BD/WireLurkerDetector)\n"
+            "    value: Artifact used by this malware - 🔥\n".encode("utf-8")
+        )
+        pack_file.name = get_random_string(12)
+        response = self.client.post(reverse("osquery:upload_pack", args=(pack.pk,)),
+                                    {"file": pack_file,
+                                     "update_and_create_only": "on"},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "osquery/pack_detail.html")
+        self.assertContains(response, "WireLurker")
+        self.assertContains(response, "query created: 1")
+        pack = response.context["object"]
+        self.assertEqual(pack.packquery_set.count(), 1)
+        query = pack.packquery_set.first().query
+        self.assertEqual(query.name, f"{pack.slug}/WireLurker")
+
+    def test_upload_bad_file(self):
+        pack = self._force_pack()
+        self._login("osquery.change_pack", "osquery.view_pack")
+        pack_file = BytesIO(b"""{"queries": {}""")  # bad JSON, cannot be parsed
+        pack_file.name = get_random_string(12)
+        response = self.client.post(reverse("osquery:upload_pack", args=(pack.pk,)),
+                                    {"file": pack_file,
+                                     "update_and_create_only": "on"},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "osquery/pack_upload.html")
+        self.assertFormError(
+            response.context["form"], "file",
+            "Could not parse pack file."
+        )
+
+    def test_upload_bad_data(self):
+        pack = self._force_pack()
+        self._login("osquery.change_pack", "osquery.view_pack")
+        pack_file = BytesIO(b"-####")  # can be parsed but bad structure
+        pack_file.name = get_random_string(12)
+        response = self.client.post(reverse("osquery:upload_pack", args=(pack.pk,)),
+                                    {"file": pack_file,
+                                     "update_and_create_only": "on"},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "osquery/pack_upload.html")
+        self.assertFormError(
+            response.context["form"], "file",
+            "non_field_errors: Invalid data. Expected a dictionary, but got str."
+        )
 
     # delete pack
 
@@ -231,9 +315,9 @@ class OsquerySetupPacksViewsTestCase(TestCase):
                                      "log_removed_actions": "on", "snapshot_mode": "on"}, follow=True)
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "osquery/packquery_form.html")
-        self.assertFormError(response, "form", "log_removed_actions",
+        self.assertFormError(response.context["form"], "log_removed_actions",
                              "'Log removed actions' and 'Snapshot mode' are mutually exclusive")
-        self.assertFormError(response, "form", "snapshot_mode",
+        self.assertFormError(response.context["form"], "snapshot_mode",
                              "'Log removed actions' and 'Snapshot mode' are mutually exclusive")
 
     def test_add_pack_query_post(self):
@@ -274,7 +358,7 @@ class OsquerySetupPacksViewsTestCase(TestCase):
                                      "log_removed_actions": "on"}, follow=True)
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "osquery/packquery_form.html")
-        self.assertFormError(response, "form", "snapshot_mode",
+        self.assertFormError(response.context["form"], "snapshot_mode",
                              "A compliance check query can only be scheduled in 'snapshot' mode.")
 
     def test_add_pack_query_with_compliance_check(self):
@@ -324,9 +408,9 @@ class OsquerySetupPacksViewsTestCase(TestCase):
                                      "log_removed_actions": "on", "snapshot_mode": "on"}, follow=True)
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "osquery/packquery_form.html")
-        self.assertFormError(response, "form", "log_removed_actions",
+        self.assertFormError(response.context["form"], "log_removed_actions",
                              "'Log removed actions' and 'Snapshot mode' are mutually exclusive")
-        self.assertFormError(response, "form", "snapshot_mode",
+        self.assertFormError(response.context["form"], "snapshot_mode",
                              "'Log removed actions' and 'Snapshot mode' are mutually exclusive")
 
     def test_update_pack_query_post(self):

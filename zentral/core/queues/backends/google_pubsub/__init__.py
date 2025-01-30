@@ -5,13 +5,13 @@ import queue
 import random
 import threading
 import time
-from django.db import DatabaseError, InterfaceError
 from django.utils.functional import cached_property
 from django.utils.text import slugify
 from kombu.utils import json
 from google.cloud import pubsub_v1
 from google.oauth2 import service_account
 from zentral.conf import settings
+from zentral.core.queues.backends.base import BaseEventQueues
 from zentral.core.queues.exceptions import RetryLater
 from .consumer import BaseWorker, Consumer, ConsumerProducer
 
@@ -80,13 +80,10 @@ class EnrichWorker(ConsumerProducer):
             for event in self.enrich_event(event_dict):
                 self.publish_event(event, machine_metadata=True)
                 self.inc_counter("produced_events", event.event_type)
-        except (DatabaseError, InterfaceError):
-            self.log_exception("DB exception. Shutdown")
+        except Exception:
+            self.log_exception("Exception. NACK and shutdown")
             message.nack()
             self.shutdown(error=True)
-        except Exception:
-            self.log_exception("Other exception. NACK")
-            message.nack()
         else:
             message.ack()
             self.inc_counter("enriched_events", event_type)
@@ -134,13 +131,10 @@ class StoreWorker(Consumer):
             return
         try:
             self.event_store.store(event_dict)
-        except (DatabaseError, InterfaceError):
-            self.log_exception("DB exception. Shutdown")
+        except Exception:
+            self.log_exception("Exception. NACK and shutdown")
             message.nack()
             self.shutdown(error=True)
-        except Exception:
-            self.log_exception("Other exception. NACK")
-            message.nack()
         else:
             message.ack()
             self.inc_counter("stored_events", event_type)
@@ -341,7 +335,7 @@ class BulkStoreWorker(BaseWorker):
 
     def do_handle_signal(self):
         if not self.stop_receiving_event.is_set():
-            self.log_error("stop receiving events")
+            self.log_info("stop receiving events")
             self.stop_receiving_event.set()
 
     def do_run(self):
@@ -373,21 +367,22 @@ class BulkStoreWorker(BaseWorker):
             self.exit_code = 1
             self.log_error("run loop exception: %s", e)
             if not self.stop_receiving_event.is_set():
-                self.log_error("stop receiving")
+                self.log_info("stop receiving")
                 self.stop_receiving_event.set()
 
         # graceful stop
         if not self.stop_event.is_set():
-            self.log_error("set stop event")
+            self.log_info("set stop event")
             self.stop_event.set()
             for thread in threads:
                 thread.join()
-            self.log_error("all threads stopped")
+            self.log_info("all threads stopped")
         self.subscriber_client.close()
 
 
-class EventQueues(object):
+class EventQueues(BaseEventQueues):
     def __init__(self, config_d):
+        super().__init__(config_d)
         # topics
         topics = config_d["topics"]
         self.raw_events_topic = topics["raw_events"]

@@ -1,3 +1,4 @@
+import base64
 import os
 import subprocess
 from tempfile import NamedTemporaryFile
@@ -5,7 +6,7 @@ from asn1crypto import cms
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.x509.oid import NameOID
 from django.utils.crypto import get_random_string
 from django.utils.functional import SimpleLazyObject
@@ -92,16 +93,7 @@ def get_cryptography_hash_algorithm(signer):
         raise ValueError("Unknown hash {}".format(hash_name))
 
 
-def get_cryptography_asymmetric_padding(signer):
-    padding_name = signer["signature_algorithm"].signature_algo
-    if padding_name == "rsassa_pkcs1v15":
-        return padding.PKCS1v15
-    else:
-        raise ValueError("Unknown padding {}".format(padding_name))
-
-
 def verify_certificate_signature(certificate, signer, payload):
-    public_key = certificate.public_key()
     signature = signer['signature'].native
     if "signed_attrs" in signer and signer["signed_attrs"]:
         # Seen with the iPhone simulator for example
@@ -112,23 +104,36 @@ def verify_certificate_signature(certificate, signer, payload):
             signed_string = b'\x31' + signed_string[1:]
     else:
         signed_string = payload
-    asymmetric_padding = get_cryptography_asymmetric_padding(signer)
+    public_key = certificate.public_key()
+    signature_algo = signer["signature_algorithm"].signature_algo
     hash_algorithm = get_cryptography_hash_algorithm(signer)
-    try:
-        public_key.verify(signature, signed_string,
-                          asymmetric_padding(), hash_algorithm())
-    except InvalidSignature:
-        return False
+    if signature_algo == "rsassa_pkcs1v15":
+        try:
+            public_key.verify(signature, signed_string,
+                              padding.PKCS1v15(), hash_algorithm())
+        except InvalidSignature:
+            return False
+    elif signature_algo == "ecdsa":
+        try:
+            public_key.verify(signature, signed_string,
+                              ec.ECDSA(hash_algorithm()))
+        except InvalidSignature:
+            return False
     else:
-        return True
+        raise ValueError(f"Unknown signature_algo {signature_algo}")
+    return True
 
 
-def verify_signed_payload(data):
-    content_info = cms.ContentInfo.load(data)
+def verify_signed_payload(payload, detached_signature=None):
+    if detached_signature:
+        content_info = cms.ContentInfo.load(detached_signature)
+    else:
+        content_info = cms.ContentInfo.load(payload)
     if content_info["content_type"].native != "signed_data":
         raise ValueError("Not signed data")
     content = content_info["content"]
-    payload = content['encap_content_info']['content'].native
+    if not detached_signature:
+        payload = content['encap_content_info']['content'].native
     certificates = []
     for signer in content["signer_infos"]:
         certificate_i, certificate_bytes, certificate = get_signer_certificate(content, signer)
@@ -146,9 +151,7 @@ def verify_iphone_ca_signed_payload(data):
     raise ValueError("Untrusted CA")
 
 
-def decrypt_cms_payload(payload, privkey_bytes, privkey_password=None):
-    # load the private key
-    private_key = serialization.load_pem_private_key(privkey_bytes, privkey_password)
+def decrypt_cms_payload(payload, private_key, der=False):
     # encrypt the private key, using a temporary password
     tmp_inkey_pwd = get_random_string(length=42).encode("utf-8")
     tmp_inkey_data = private_key.private_bytes(
@@ -165,29 +168,66 @@ def decrypt_cms_payload(payload, privkey_bytes, privkey_password=None):
         tmp_inkey_file.write(tmp_inkey_data)
         tmp_inkey_file.flush()
         # decrypt the payload
-        p = subprocess.Popen(["/usr/bin/openssl", "smime", "-decrypt",
-                              "-inkey", tmp_inkey_file.name, "-passin", f"env:{env_var}"],
-                             stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE,
-                             env=env)
-        stdout, _ = p.communicate(payload)
-        return stdout
+        openssl_args = [
+            "/usr/bin/openssl",
+            "smime", "-decrypt",
+            "-inkey", tmp_inkey_file.name, "-passin", f"env:{env_var}"
+        ]
+        if der:
+            openssl_args.extend(["-inform", "der"])
+        cp = subprocess.run(
+            openssl_args,
+            input=payload,
+            capture_output=True,
+            check=True,
+            env=env,
+        )
+        return cp.stdout
 
 
-def encrypt_cms_payload(payload, public_key_bytes):
+def decrypt_cms_payload_with_pem_privkey(payload, privkey_bytes):
+    # load the private key
+    private_key = serialization.load_pem_private_key(privkey_bytes, None)
+    return decrypt_cms_payload(payload, private_key)
+
+
+def encrypt_cms_payload(payload, public_key_bytes, raw_output=False):
     # write the public key in a temporary file
     with NamedTemporaryFile() as tmp_pubkey_file:
         tmp_pubkey_file.write(public_key_bytes)
         tmp_pubkey_file.flush()
-        # encrypt the paload
+        # encrypt the payload
         p = subprocess.Popen(["/usr/bin/openssl", "smime",  "-encrypt", tmp_pubkey_file.name],
                              stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE)
         stdout, _ = p.communicate(payload)
-        return stdout
+        if raw_output:
+            return base64.b64decode(stdout.split(b"\n\n")[1].replace(b"\n", b""))
+        else:
+            return stdout
 
 
 # push certificate
+
+
+def generate_push_certificate_key_bytes(key_size=2048):
+    key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=key_size,
+    )
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption()
+    )
+
+
+def generate_push_certificate_csr_der_bytes(push_certificate):
+    key = serialization.load_pem_private_key(push_certificate.get_private_key(), None)
+    csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, f"Zentral Push Certificate {push_certificate.pk}")
+    ])).sign(key, hashes.SHA256())
+    return csr.public_bytes(serialization.Encoding.DER)
 
 
 def load_push_certificate_and_key(cert_pem_bytes, key_pem_bytes, password=None):
@@ -211,7 +251,7 @@ def load_push_certificate_and_key(cert_pem_bytes, key_pem_bytes, password=None):
     # (TODO verify <1024bit with padding.OAEP → error)
     pad = padding.PKCS1v15()
     try:
-        key.decrypt(cert.public_key().encrypt(message, pad), pad)
+        assert key.decrypt(cert.public_key().encrypt(message, pad), pad) == message
     except Exception:
         raise ValueError("The certificate and key do not form a pair")
     try:
@@ -224,6 +264,6 @@ def load_push_certificate_and_key(cert_pem_bytes, key_pem_bytes, password=None):
                 serialization.PrivateFormat.PKCS8,
                 serialization.NoEncryption()
             ),
-            "not_before": cert.not_valid_before,
-            "not_after": cert.not_valid_after,
+            "not_before": cert.not_valid_before_utc,
+            "not_after": cert.not_valid_after_utc,
             "topic": topic}

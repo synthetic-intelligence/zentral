@@ -9,6 +9,7 @@ import plistlib
 import ssl
 import subprocess
 import sys
+import time
 import urllib.request
 import warnings
 import zlib
@@ -17,12 +18,17 @@ MANAGED_INSTALLS_DIR = "/Library/Managed Installs"
 ARCHIVES_DIR = os.path.join(MANAGED_INSTALLS_DIR, "Archives")
 APPLICATION_INVENTORY = os.path.join(MANAGED_INSTALLS_DIR, "ApplicationInventory.plist")
 
-USER_AGENT = "Zentral/munkipostflight 0.12"
-ZENTRAL_API_ENDPOINT = "https://%TLS_HOSTNAME%/munki/"  # set during the package build
+USER_AGENT = "Zentral/munkipostflight 0.17"
+ZENTRAL_API_ENDPOINT = "https://%TLS_HOSTNAME%/public/munki/"  # set during the package build
 ZENTRAL_API_SERVER_CERTIFICATE = "%TLS_SERVER_CERTS%"  # set during the package build
 ZENTRAL_API_AUTH_TOKEN = "%TOKEN%"  # set during the enrollment in the postinstall script of the enrollment package
 
 SYSTEM_PROFILER = "/usr/sbin/system_profiler"
+
+SCRIPT_CHECK_TIMEOUT = 3  # timeout in seconds for each script check
+SCRIPT_CHECK_STATUS_OK = 0
+SCRIPT_CHECK_STATUS_UNKNOWN = 200
+SCRIPT_CHECK_STATUS_FAILED = 300
 
 
 # OSX apps
@@ -289,7 +295,127 @@ def build_managed_installs_payload():
     return sorted((n, v, dn, t) for n, (v, dn, t) in managed_installs.items())
 
 
+# Script checks
+
+
+def get_current_user_info():
+    current_user = curr_user_id = None
+    try:
+        info = subprocess.check_output(
+          '/usr/sbin/scutil <<< "show State:/Users/ConsoleUser"',
+          shell=True, encoding="utf-8"
+        )
+    except Exception:
+        pass
+    else:
+        for line in info.splitlines():
+            line = line.strip()
+            if line.startswith("Name : "):
+                found_user = line[7:]
+                if "loginwindow" in found_user.lower():
+                    current_user = current_user = None
+                    break
+                current_user = found_user
+            elif line.startswith("UID : "):
+                curr_user_id = int(line[6:])
+    return current_user, curr_user_id
+
+
+def get_script_check_env():
+    env = os.environ.copy()
+    current_user, curr_user_id = get_current_user_info()
+    if current_user is not None:
+        env["CURRENT_USER"] = current_user
+    if curr_user_id is not None:
+        env["CURR_USER_ID"] = str(curr_user_id)
+    return env
+
+
+def convert_script_check_int_result(result):
+    return int(result)
+
+
+def convert_script_check_bool_result(result):
+    result = result.lower()
+    if result in ("f", "false"):
+        result = "0"
+    elif result in ("t", "true"):
+        result = "1"
+    result = int(result)
+    assert result in (0, 1)
+    return bool(result)
+
+
+def run_script_check(script_check, env):
+    start_time = time.monotonic()
+    cp = subprocess.run(
+        ["/bin/zsh"],
+        input=script_check["source"],
+        capture_output=True,
+        encoding="utf-8",
+        timeout=SCRIPT_CHECK_TIMEOUT,
+        env=env,
+    )
+    time_elapsed = time.monotonic() - start_time
+    expected_result = script_check["expected_result"]
+    result = cp.stdout.strip()
+    if script_check["type"] == "ZSH_INT":
+        try:
+            result = convert_script_check_int_result(result)
+        except Exception:
+            return SCRIPT_CHECK_STATUS_UNKNOWN, time_elapsed
+    elif script_check["type"] == "ZSH_BOOL":
+        try:
+            result = convert_script_check_bool_result(result)
+        except Exception:
+            return SCRIPT_CHECK_STATUS_UNKNOWN, time_elapsed
+    if result == expected_result:
+        return SCRIPT_CHECK_STATUS_OK, time_elapsed
+    else:
+        return SCRIPT_CHECK_STATUS_FAILED, time_elapsed
+
+
+def run_script_checks(script_checks):
+    env = get_script_check_env()
+    results = []
+    for script_check in script_checks:
+        status, time_elapsed = run_script_check(script_check, env)
+        results.append({
+            "pk": script_check["pk"],
+            "version": script_check["version"],
+            "status": status,
+            "time": time_elapsed,
+        })
+    return results
+
+
 # Machine infos
+
+
+def build_os_version_dict(os_version_str):
+    return dict(zip(['major', 'minor', 'patch'],
+                    (int(s) for s in os_version_str.split('.'))))
+
+
+def get_sw_ver_os_version():
+    os_version = {}
+    try:
+        result = subprocess.check_output(["/usr/bin/sw_vers"], encoding="utf-8")
+    except Exception:
+        # should never happen
+        print("Could not run sw_vers")
+        return os_version
+    for line in result.splitlines():
+        key, val = (s.strip() for s in line.strip().split(":"))
+        if key == "ProductName":
+            os_version["name"] = val
+        elif key == "ProductVersion":
+            os_version.update(build_os_version_dict(val))
+        elif key == "BuildVersion":
+            os_version["build"] = val
+        elif key == "ProductVersionExtra":
+            os_version["version"] = val
+    return os_version
 
 
 class SystemProfilerReport(object):
@@ -318,7 +444,8 @@ class SystemProfilerReport(object):
 
         serial_number = item_d['serial_number']
         system_info = {'hardware_model': item_d['machine_model'],
-                       'cpu_type': item_d.get('cpu_type', None)}
+                       'cpu_type': item_d.get('cpu_type', None),
+                       'cpu_brand': item_d.get('chip_type', None)}
         # RAM
         ram_multiplicator = None
         ram_amount, ram_amount_unit = item_d['physical_memory'].split()
@@ -349,13 +476,14 @@ class SystemProfilerReport(object):
         uptime = int(timedelta(**td_kwargs).total_seconds())
 
         # OS version
-        os_version = item_d['os_version']
-        os_name, os_version_str, os_build = os_version.rsplit(' ', 2)
-        os_build = os_build.strip('()')
-        os_version = {'name': os_name,
-                      'build': os_build}
-        os_version.update(dict(zip(['major', 'minor', 'patch'],
-                                   (int(s) for s in os_version_str.split('.')))))
+        os_version = get_sw_ver_os_version()
+        if not os_version:
+            os_version = item_d['os_version']
+            os_name, os_version_str, os_build = os_version.rsplit(' ', 2)
+            os_build = os_build.strip('()')
+            os_version = {'name': os_name,
+                          'build': os_build}
+            os_version.update(build_os_version_dict(os_version_str))
         return {'serial_number': serial_number,
                 'system_info': system_info,
                 'os_version': os_version,
@@ -600,6 +728,27 @@ def get_logged_in_user_principal_user(domains):
         pass
 
 
+# munkilib version
+
+
+def get_munkilib_version_info():
+    info = {}
+    try:
+        with open("/usr/local/munki/munkilib/version.plist", "rb") as f:
+            raw_info = plistlib.load(f)
+    except Exception:
+        return info
+    if not isinstance(raw_info, dict):
+        return info
+    for plist_attr, attr in (("BuildNumber", "build"),
+                             ("CFBundleShortVersionString", "version"),
+                             ("GitRevision", "revision")):
+        val = raw_info.get(plist_attr)
+        if isinstance(val, str):
+            info[f"munkilib_{attr}"] = val
+    return info
+
+
 # Zentral Munki API calls
 
 
@@ -724,6 +873,9 @@ if __name__ == '__main__':
             pass
         else:
             machine_snapshot['extra_facts'] = latest_mir.get_extra_facts(collected_condition_keys)
+    munkilib_version_info = get_munkilib_version_info()
+    if munkilib_version_info:
+        machine_snapshot.setdefault('extra_facts', {}).update(munkilib_version_info)
 
     data = {'machine_snapshot': machine_snapshot}
 
@@ -733,6 +885,11 @@ if __name__ == '__main__':
     # add the managed installs if requested or last seen report not found
     if job_details.get('managed_installs', True) or not data['last_seen_report_found']:
         data['managed_installs'] = build_managed_installs_payload()
+
+    # run the script checks
+    script_checks = job_details.get("script_checks")
+    if isinstance(script_checks, list):
+        data["script_check_results"] = run_script_checks(script_checks)
 
     # post the payload to zentral
     post_job(data)

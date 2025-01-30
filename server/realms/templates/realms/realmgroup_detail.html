@@ -1,0 +1,97 @@
+{% extends 'base.html' %}
+{% load ui_extras %}
+
+{% block content %}
+<ol class="breadcrumb">
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'realms:index' %}">SSO</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'realms:groups' %}">Groups</a></li>
+  <li class="breadcrumb-item active">{{ object }}</li>
+</ol>
+
+<div class="object-details">
+  <div class="d-flex align-items-center mb-1">
+    <h2 class="m-0">{{ object }}</h2>
+  </div>
+  <div class="d-flex align-items-center mb-3">
+    <h3 class="m-0 fs-5 text-secondary">Group</i></h3>
+    <div class="ms-auto">
+      {% if perms.realms.change_realmgroup and object.can_be_updated %}
+        {% url 'realms:update_group' object.pk as url %}
+        {% button 'UPDATE' url "Edit group" %}
+      {% endif %}
+      {% if perms.realms.delete_realmgroup and object.can_be_deleted %}
+        {% url 'realms:delete_group' object.pk as url %}
+        {% button 'DELETE' url "Delete group" %}
+      {% endif %}
+    </div>
+  </div>
+  <div class="table-responsive mb-3">
+  <table class="table-object-properties">
+    <thead>
+      <th>Attribute</th>
+      <th>Value</th>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Realm</td>
+        <td>
+          {% if perms.realms.view_realm %}
+          <a href="{{ object.realm.get_absolute_url }}">{{ object.realm }}</a>
+          {% else %}
+          {{ object.realm }}
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <td>SCIM managed?</td>
+        <td>{{ object.scim_managed|yesno }}</td>
+      </tr>
+      <tr>
+        <td>Display name</td>
+        <td>{{ object.display_name }}</td>
+      </tr>
+      <tr>
+        <td>Parent</td>
+        <td>
+          {% if object.parent %}
+          <a href="{{ object.parent.get_absolute_url }}">{{ object.parent }}</a>
+          {% else %}
+          -
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <td>Child{{ children|length|pluralize:",ren" }} ({{ children|length }})</td>
+        <td>
+          {% if children %}
+          <ul class="list-unstyled">
+            {% for child in children %}
+            <li><a href="{{ child.get_absolute_url }}">{{ child }}</a></li>
+            {% endfor %}
+          </ul>
+          {% else %}
+          -
+          {% endif %}
+        </td>
+      </tr>
+      <tr>
+        <td>User{{ user_count|pluralize }} ({{ user_count }})</td>
+        <td>
+          {% if users_url %}
+          <a href="{{ users_url|safe }}">View all users</a>
+          {% else %}
+          -
+          {% endif %}
+        </td>
+      </tr>
+    </tbody>
+  </table>
+  {% created_updated_at object %}
+</div>
+
+{% include "realms/_realm_group_mappings.html" with hide_realm="True" hide_realm_group="True" %}
+
+{% include "realms/_role_mappings.html" with hide_realm="True" hide_realm_group="True" %}
+
+{% endblock %}

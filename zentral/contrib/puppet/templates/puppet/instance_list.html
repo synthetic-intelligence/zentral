@@ -1,18 +1,17 @@
 {% extends 'base.html' %}
-{% load bootstrap %}
 
 {% block content %}
 <ol class="breadcrumb">
-  <li><a href="/">Home</a></li>
-  <li><a href="{% url 'puppet:index' %}">Puppet</a></li>
-  <li class="active">Instance{{ instance_count|pluralize }}</li>
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'puppet:index' %}">Puppet</a></li>
+  <li class="breadcrumb-item active">Instance{{ instance_count|pluralize }}</li>
 </ol>
 
 <h2>{{ instance_count }} Puppet instance{{ instance_count|pluralize }}</h2>
 
 {% if perms.puppet.add_instance %}
 <p>
-  <a href="{% url 'puppet:create_instance' %}" class="btn btn-default">Create</a>
+  <a href="{% url 'puppet:create_instance' %}" class="btn btn-outline-secondary">Create</a>
 </p>
 {% endif %}
 
@@ -35,7 +34,7 @@
       </td>
       {% if perms.puppet.change_instance %}
       <td>
-        <a href="{% url 'puppet:update_instance' instance.pk %}" class="btn btn-default">
+        <a href="{% url 'puppet:update_instance' instance.pk %}" class="btn btn-outline-secondary">
           <span class="glyphicon glyphicon-edit" aria-hidden="true"></span> Update
         </a>
       </td>

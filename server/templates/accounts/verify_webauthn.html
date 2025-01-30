@@ -1,32 +1,19 @@
 {% extends 'base.html' %}
-{% load bootstrap %}
 
 {% block content %}
-<div class="row">
-  <div class="col-md-4 col-md-offset-4">
-    <form id="form" action="{% url 'accounts:verify_webauthn' %}" class="panel panel-default" method="POST">{% csrf_token %}
-      <input type="hidden" id="token_response" name="token_response">
-      <div class="panel-heading">
-        <h3 class="panel-title">
-          Two-factor authentication - Security key
-        </h3>
-      </div>
-      <div class="panel-body">
-        <p id="message">When you are ready to authenticate, press the button below.</p>
-      </div>
-      <div id="footer" class="panel-footer btn-group btn-group-justified" role="group" aria-label="retry security key verification">
-        <div class="btn-group" role="group">
-          <a id="start" class="btn btn-success">Use security key</a>
-        </div>
-        <div class="btn-group" role="group" style="display:none;">
-          <a id="message_retry" class="btn btn-primary">Retry</a>
-        </div>
-      </div>
-    </form>
-    {% for link, anchor_text in form.get_alternative_verification_links %}
-    <p><a href="{{ link }}"><u>{{ anchor_text }}</u></a></p>
-    {% endfor %}
-  </div>
+<div class="reg-container">
+  <form action="{% url 'accounts:verify_webauthn' %}" method="POST">{% csrf_token %}
+    <input type="hidden" id="token_response" name="token_response">
+    <h1 class="reg-title">MFA - Security key</h1>
+    <p class="my-3" id="message">When you are ready to authenticate, press the button below.</p>
+    <p id="footer" class="my-3">
+      <a id="start" class="reg-btn-primary">Use security key</a>
+      <a id="message_retry" class="reg-btn-primary" style="display:none;">Retry</a>
+    </p>
+  </form>
+  {% for link, anchor_text in form.get_alternative_verification_links %}
+  <p class="mb-3"><a href="{{ link }}">{{ anchor_text }}</a></p>
+  {% endfor %}
 </div>
 {% endblock %}
 
@@ -59,7 +46,8 @@
 
   function show_message (message, retry) {
     $("#footer").toggle(retry);
-    $("#message_retry").parent().toggle(retry);
+    $("#start").toggle(!retry);
+    $("#message_retry").toggle(retry);
     $("#message").text(message);
   }
 
@@ -76,7 +64,10 @@
           authenticatorData: ab2str(r.authenticatorData),
           clientDataJSON: ab2str(r.clientDataJSON),
           signature: ab2str(r.signature),
-        }
+          userHandle: ab2str(r.userHandle)
+        },
+        type: credential.type,
+        authenticatorAttachment: credential.authenticatorAttachment
       };
       show_message("OK", false);
       document.getElementById('token_response').value = JSON.stringify(data);

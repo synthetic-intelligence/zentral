@@ -1,18 +1,36 @@
 {% extends 'base.html' %}
+{% load ui_extras %}
 
 {% block content %}
 <ol class="breadcrumb">
-  <li><a href="/">Home</a></li>
-  <li><a href="{% url 'accounts:groups' %}">Groups</a></li>
-  <li class="active">{{ object }}</li>
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'accounts:groups' %}">Roles</a></li>
+  <li class="breadcrumb-item active">{{ object }}</li>
 </ol>
 
-<h3>{{ object }}</h3>
+<div class="object-details">
+    <div class="d-flex align-items-center mb-1">
+        <h2 class="m-0">{{ object }}</h2>
+    </div>
+    <div class="d-flex align-items-center mb-3">
+        <h3 class="m-0 fs-5 text-secondary">Role</h3>
+        <div class="ms-auto">
+            {% if perms.auth.change_group and perms.accounts.change_user %}
+                {% url 'accounts:update_group' object.pk as url %}
+                {% button 'UPDATE' url "Edit role" %}
+            {% endif %}
+            {% if perms.auth.delete_group and perms.accounts.change_user %}
+                {% url 'accounts:delete_group' object.pk as url %}
+                {% button 'DELETE' url "Delete role" %}
+            {% endif %}        
+        </div>
+    </div>
+</div>
 
-<h4>{{ permission_count }} Permission{{ permission_count|pluralize }}</h4>
+<h3>Permission{{ permission_count|pluralize }} ({{ permission_count }})</h3>
 
 {% if permission_count %}
-<table class="table">
+<table class="table table-striped align-middle object-details">
   <thead>
     <th>App</th>
     <th>Model</th>
@@ -30,19 +48,10 @@
 </table>
 {% endif %}
 
-<p>
-  {% if perms.auth.change_group and perms.accounts.change_user %}
-  <a href="{% url 'accounts:update_group' object.pk %}" class="btn btn-default">Update</a>
-  {% endif %}
-  {% if perms.auth.delete_group and perms.accounts.change_user %}
-  <a href="{% url 'accounts:delete_group' object.pk %}" class="btn btn-danger">Delete</a>
-  {% endif %}
-</p>
-
 {% if perms.accounts.view_user %}
-<h4>{{ user_count }} User{{ user_count|pluralize }}</h4>
+<h3>User{{ user_count|pluralize }} ({{ user_count }})</h3>
 {% if user_count %}
-<table class="table">
+<table class="table table-striped align-middle table-hover">
   <thead>
     <th>Username</th>
     <th>Email</th>
@@ -62,9 +71,9 @@
 {% endif %}
 
 {% if perms.accounts.view_user %}
-<h4>{{ service_account_count }} Service account{{ service_account_count|pluralize }}</h4>
+<h3>Service account{{ service_account_count|pluralize }} ({{ service_account_count }})</h3>
 {% if service_account_count %}
-<table class="table">
+<table class="table table-striped align-middle table-hover">
   <thead>
     <th>Name</th>
   </thead>
@@ -79,30 +88,6 @@
 {% endif %}
 {% endif %}
 
-{% if perms.realms.view_realmgroupmapping %}
-<h4>{{ realm_group_mapping_count }} Realm mapping{{ realm_group_mapping_count|pluralize }}</h4>
-{% if realm_group_mapping_count %}
-<table class="table">
-  <thead>
-    {% if perms.realms.view_realm %}
-    <th>Realm</th>
-    {% endif %}
-    <th>Claim</th>
-    <th>Value</th>
-  </thead>
-  <tbody>
-    {% for realm_group_mapping in realm_group_mappings %}
-    <tr>
-      {% if perms.realms.view_realm %}
-      <td><a href="{{ realm_group_mapping.realm.get_absolute_url }}">{{ realm_group_mapping.realm }}</a></td>
-      {% endif %}
-      <td>{{ realm_group_mapping.claim }}</td>
-      <td>{{ realm_group_mapping.value }}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
-{% endif %}
-{% endif %}
+{% include "realms/_role_mappings.html" with hide_role="True" %}
 
 {% endblock %}

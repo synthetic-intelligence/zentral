@@ -1,0 +1,23 @@
+{% extends 'base.html' %}
+
+{% block content %}
+<ol class="breadcrumb">
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'osquery:index' %}">Osquery</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'osquery:packs' %}">Packs</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'osquery:pack' object.pk %}">{{ object }}</a></li>
+  <li class="breadcrumb-item active">Upload</li>
+</ol>
+
+<h2>Upload pack</h2>
+
+<form method="post" class="update-form" enctype="multipart/form-data">{% csrf_token %}
+  {{ form }}
+  <p>
+    <a class="btn btn-outline-secondary" href="{{ object.get_absolute_url }}">
+      Cancel
+    </a>
+    <button class="btn btn-primary" type="submit">Save</button>
+  </p>
+</form>
+{% endblock %}

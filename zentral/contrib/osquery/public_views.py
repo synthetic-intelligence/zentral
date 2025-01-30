@@ -19,17 +19,17 @@ from zentral.contrib.osquery.conf import build_osquery_conf, INVENTORY_QUERY_NAM
 from zentral.contrib.osquery.events import (post_enrollment_event,
                                             post_file_carve_events,
                                             post_request_event, post_results, post_status_logs)
-from zentral.contrib.osquery.models import (parse_result_name,
-                                            DistributedQuery, DistributedQueryMachine, DistributedQueryResult,
+from zentral.contrib.osquery.models import (DistributedQuery, DistributedQueryMachine, DistributedQueryResult,
                                             EnrolledMachine,
                                             FileCarvingBlock, FileCarvingSession,
-                                            PackQuery)
+                                            PackQuery, parse_result_name)
+from zentral.contrib.osquery.tags import TagUpdateAggregator
 from zentral.contrib.osquery.tasks import build_file_carving_session_archive
 from zentral.core.events.base import post_machine_conflict_event
 from zentral.utils.http import user_agent_and_ip_address_from_request
 from zentral.utils.json import remove_null_character
 from .views.utils import (prepare_file_carving_session_if_necessary,
-                    update_tree_with_enrollment_host_details, update_tree_with_inventory_query_snapshot)
+                          update_tree_with_enrollment_host_details, update_tree_with_inventory_query_snapshot)
 
 
 logger = logging.getLogger('zentral.contrib.osquery.views.api')
@@ -310,22 +310,38 @@ class DistributedWriteView(BaseNodeView):
         results = self.data.get("queries", {})
         statuses = self.data.get("statuses", {})
         messages = self.data.get("messages", {})
-        dqm_pk_set = set(chain(results.keys(), statuses.keys(), messages.keys()))
+        stats = self.data.get("stats", {})
+        dqm_pk_set = set(chain(results.keys(), statuses.keys(), messages.keys(), stats.keys()))
         if not dqm_pk_set:
             return {}
         dqm_cache = {str(dqm.pk): dqm
                      for dqm in DistributedQueryMachine.objects
-                                                       .select_related("distributed_query__query__compliance_check")
+                                                       .select_related("distributed_query__query__compliance_check",
+                                                                       "distributed_query__query__tag")
                                                        .filter(pk__in=dqm_pk_set)}
 
         # update distributed query machines
         for dqm_pk, dqm in dqm_cache.items():
-            status = statuses.get(dqm_pk)
-            if status is None:
+            # status
+            dqm_status = statuses.get(dqm_pk)
+            if dqm_status is None:
                 logger.warning("Missing status for DistributedQueryMachine %s", dqm_pk)
-                status = 999  # TODO: better?
-            dqm.status = status
+                dqm_status = 999  # TODO: better?
+            dqm.status = dqm_status
+            # error message
             dqm.error_message = messages.get(dqm_pk)
+            # stats
+            dqm_stats = stats.get(dqm_pk)
+            if dqm_stats:
+                for stat_attr in ("memory", "system_time", "user_time", "wall_time_ms"):
+                    val = dqm_stats.get(stat_attr)
+                    if val is not None:
+                        try:
+                            val = int(val)
+                        except (TypeError, ValueError):
+                            pass
+                        else:
+                            setattr(dqm, stat_attr, val)
             dqm.save()
 
         # save_results
@@ -358,22 +374,33 @@ class DistributedWriteView(BaseNodeView):
                 # only test the first tuple
                 break
 
-        # process compliance checks
+        # process compliance checks & tag updates
         cc_status_agg = ComplianceCheckStatusAggregator(self.machine.serial_number)
-        status_time = datetime.utcnow()  # TODO: how to get a better time? add ztl_status_time = now() to the query?
+        tag_update_agg = TagUpdateAggregator(self.machine.serial_number)
+        result_time = datetime.utcnow()  # TODO: how to get a better time? add ztl_status_time = now() to the query?
         for dqm_pk, dqm in dqm_cache.items():
             distributed_query = dqm.distributed_query
             query = distributed_query.query
-            if not query or not query.compliance_check:
+            if not query:
                 continue
-            cc_status_agg.add_result(
-                query.pk,
-                distributed_query.query_version,
-                status_time,
-                results.get(dqm_pk, []),
-                distributed_query.pk
-            )
+            if query.compliance_check:
+                cc_status_agg.add_result(
+                    query.pk,
+                    distributed_query.query_version,
+                    result_time,
+                    results.get(dqm_pk, []),
+                    distributed_query.pk
+                )
+            elif query.tag:
+                tag_update_agg.add_result(
+                    query.pk,
+                    distributed_query.query_version,
+                    result_time,
+                    results.get(dqm_pk, []),
+                    distributed_query.pk
+                )
         cc_status_agg.commit_and_post_events()
+        tag_update_agg.commit()
 
         return {}
 
@@ -436,7 +463,7 @@ class LogView(BaseNodeView):
                         file_carving_session = prepare_file_carving_session_if_necessary(columns)
                         if file_carving_session:
                             try:
-                                pack_pk, query_pk, _, _ = parse_result_name(record["name"])
+                                pack_pk, _, query_pk, _, _ = parse_result_name(record["name"])
                                 pack_query = PackQuery.objects.get(pack__pk=pack_pk, query__pk=query_pk)
                             except Exception:
                                 logger.exception("could not find file carving result pack query")

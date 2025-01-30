@@ -1,0 +1,116 @@
+{% extends 'base.html' %}
+{% load base_extras inventory_extras %}
+{% load ui_extras %}
+
+{% block content %}
+<ol class="breadcrumb">
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'mdm:index' %}">MDM</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'mdm:artifacts' %}">Artifacts</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'mdm:artifact' artifact.pk %}">{{ artifact }}</a></li>
+  <li class="breadcrumb-item active">v{{ object.version }}</li>
+</ol>
+
+<div class="object-details">
+    <div class="d-flex align-items-center mb-1">
+      <h2 class="m-0">{{ artifact }} v{{ object.version }}</h2>
+    </div>
+    <div class="d-flex align-items-center mb-3">
+        <h3 class="m-0 fs-5 text-secondary">Artifact version</h3>
+        <div class="ms-auto">
+            {% if artifact.type == "Data Asset" %}
+                {% url 'mdm:download_data_asset' object.pk as url %}
+                {% button 'DOWNLOAD' url "Download Data Asset" %}
+            {% endif %}
+            {% if artifact.type == "Profile" %}
+                {% url 'mdm:download_profile' object.pk as url %}
+                {% button 'DOWNLOAD' url "Download Profile" %}
+            {% endif %}
+            {% if artifact.type == "Enterprise App" %}
+                {% url 'mdm:download_enterprise_app' object.pk as url %}
+                {% button 'DOWNLOAD' url "Download Enterprise App" %}
+            {% endif %}
+            {% if perms.mdm.change_artifactversion %}
+                {% url 'mdm:update_artifact_version' artifact.pk object.pk as url %}
+                {% button 'UPDATE' url "Edit Scope" %}
+            {% endif %}
+            {% if perms.mdm.delete_artifactversion and object.can_be_deleted %}
+                {% url 'mdm:delete_artifact_version' artifact.pk object.pk as url %}
+                {% button 'DELETE' url "Delete Artifact Version" %}
+            {% endif %}
+        </div>
+    </div>
+
+    <table class="table-object-properties">
+        <tbody>
+        {% if data_asset %}
+        {% include "mdm/_data_asset_detail.html" %}
+        {% endif %}
+        {% if declaration %}
+        {% include "mdm/_declaration_detail.html" %}
+        {% endif %}
+        {% if enterprise_app %}
+        {% include "mdm/_enterprise_app_detail.html" %}
+        {% endif %}
+        {% if profile %}
+        {% include "mdm/_profile_detail.html" %}
+        {% endif %}
+        {% if store_app %}
+        {% include "mdm/_store_app_detail.html" %}
+        {% endif %}
+        <tr>
+        <td colspan="2"><h4>Scope</h4></td>
+        </tr>
+        <tr>
+        <th style="width:33vw">Version</th>
+        <td>{{ object.version }}</td>
+        </tr>
+        <tr>
+        <th>Platforms</th>
+        <td>
+            {% if object.platforms %}
+            <ul class="list-unstyled">
+            {% for platform, versions in object.platforms.items %}
+            <li>{% if versions.min %}{{ versions.min }} ≤ {% endif %}{{ platform }}{% if versions.max %} < {{ versions.max }}{% endif %}</li>
+            {% endfor %}
+            </ul>
+            {% else %}
+            -
+            {% endif %}
+        </td>
+        </tr>
+        <tr>
+        <th>Excluded tags</th>
+        <td>
+            {% for tag in object.excluded_tags.all %}
+            {% inventory_tag tag %}
+            {% empty %}
+            -
+            {% endfor %}
+        </td>
+        </tr>
+        <tr>
+        <th>Default shards</th>
+        <td>{{ object.default_shard }}/{{ object.shard_modulo }}</td>
+        </tr>
+        <tr>
+        <th>Tag shards</th>
+        <td>
+            {% if object.tag_shards %}
+            <table>
+            {% for tag_shard in object.tag_shards %}
+            <tr><td style="padding:0 5px 2px 0">{% inventory_tag tag_shard.tag %}</td><td>{{ tag_shard.shard }}</td></tr>
+            {% endfor %}
+            </table>
+            {% else %}
+            -
+            {% endif %}
+        </td>
+        </tr>
+    </tbody>
+    </table>
+
+    {% created_updated_at object %}
+</div>
+
+{% endblock %}

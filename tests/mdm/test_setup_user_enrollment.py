@@ -7,7 +7,7 @@ from django.urls import reverse
 from django.utils.crypto import get_random_string
 from accounts.models import User
 from zentral.contrib.inventory.models import MetaBusinessUnit
-from .utils import force_push_certificate, force_scep_config, force_user_enrollment
+from .utils import force_push_certificate, force_realm, force_scep_config, force_user_enrollment
 
 
 @override_settings(STATICFILES_STORAGE='django.contrib.staticfiles.storage.StaticFilesStorage')
@@ -57,7 +57,7 @@ class MDMUserEnrollmentSetupViewsTestCase(TestCase):
         self.assertTemplateUsed(response, "mdm/userenrollment_form.html")
         self.assertContains(response, "Create user enrollment")
 
-    def test_create_user_enrollment_post(self):
+    def test_create_user_enrollment_no_realm(self):
         self._login("mdm.add_userenrollment", "mdm.view_userenrollment")
         name = get_random_string(64)
         push_certificate = force_push_certificate()
@@ -70,42 +70,66 @@ class MDMUserEnrollmentSetupViewsTestCase(TestCase):
                                      "es-meta_business_unit": self.mbu.pk},
                                     follow=True)
         self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "mdm/userenrollment_form.html")
+        self.assertFormError(response.context["user_enrollment_form"], "display_name", "This field is required.")
+        self.assertFormError(response.context["user_enrollment_form"], "realm", "This field is required")
+
+    def test_create_user_enrollment_post(self):
+        self._login("mdm.add_userenrollment", "mdm.view_userenrollment")
+        realm = force_realm()
+        name = get_random_string(64)
+        display_name = get_random_string(12)
+        push_certificate = force_push_certificate()
+        scep_config = force_scep_config()
+        response = self.client.post(reverse("mdm:create_user_enrollment"),
+                                    {"ue-realm": realm.pk,
+                                     "ue-name": name,
+                                     "ue-display_name": display_name,
+                                     "ue-scep_config": scep_config.pk,
+                                     "ue-scep_verification": "",
+                                     "ue-push_certificate": push_certificate.pk,
+                                     "es-meta_business_unit": self.mbu.pk},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "mdm/userenrollment_detail.html")
         self.assertContains(response, name)
+        self.assertContains(response, display_name)
         self.assertContains(response, push_certificate.name)
         self.assertContains(response, scep_config.name)
         self.assertContains(response, "without CSR verification")
         enrollment = response.context["object"]
         self.assertEqual(enrollment.name, name)
+        self.assertEqual(enrollment.display_name, display_name)
         self.assertEqual(enrollment.push_certificate, push_certificate)
         self.assertEqual(enrollment.scep_config, scep_config)
 
     # view User enrollment
 
     def test_view_user_enrollment_redirect(self):
-        enrollment = force_user_enrollment(self.mbu, None)
+        enrollment = force_user_enrollment(self.mbu)
         self._login_redirect(reverse("mdm:user_enrollment", args=(enrollment.pk,)))
 
     def test_view_user_enrollment_permission_denied(self):
-        enrollment = force_user_enrollment(self.mbu, None)
+        enrollment = force_user_enrollment(self.mbu)
         self._login()
         response = self.client.get(reverse("mdm:user_enrollment", args=(enrollment.pk,)))
         self.assertEqual(response.status_code, 403)
 
     def test_view_user_enrollment_no_extra_perms(self):
-        enrollment = force_user_enrollment(self.mbu, None)
+        enrollment = force_user_enrollment(self.mbu)
         self._login("mdm.view_userenrollment")
         response = self.client.get(reverse("mdm:user_enrollment", args=(enrollment.pk,)))
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "mdm/userenrollment_detail.html")
         self.assertContains(response, enrollment.name)
+        self.assertContains(response, enrollment.display_name)
         self.assertContains(response, enrollment.push_certificate.name)
         self.assertNotContains(response, enrollment.push_certificate.get_absolute_url())
         self.assertContains(response, enrollment.scep_config.name)
         self.assertNotContains(response, enrollment.scep_config.get_absolute_url())
 
     def test_view_user_enrollment_extra_perms(self):
-        enrollment = force_user_enrollment(self.mbu, None)
+        enrollment = force_user_enrollment(self.mbu)
         self._login("mdm.view_userenrollment", "mdm.view_pushcertificate", "mdm.view_scepconfig")
         response = self.client.get(reverse("mdm:user_enrollment", args=(enrollment.pk,)))
         self.assertEqual(response.status_code, 200)
@@ -119,17 +143,17 @@ class MDMUserEnrollmentSetupViewsTestCase(TestCase):
     # update User enrollment
 
     def test_update_user_enrollment_redirect(self):
-        enrollment = force_user_enrollment(self.mbu, None)
+        enrollment = force_user_enrollment(self.mbu)
         self._login_redirect(reverse("mdm:update_user_enrollment", args=(enrollment.pk,)))
 
     def test_update_user_enrollment_permission_denied(self):
-        enrollment = force_user_enrollment(self.mbu, None)
+        enrollment = force_user_enrollment(self.mbu)
         self._login()
         response = self.client.get(reverse("mdm:update_user_enrollment", args=(enrollment.pk,)))
         self.assertEqual(response.status_code, 403)
 
     def test_update_user_enrollment_get(self):
-        enrollment = force_user_enrollment(self.mbu, None)
+        enrollment = force_user_enrollment(self.mbu)
         self._login("mdm.change_userenrollment")
         response = self.client.get(reverse("mdm:update_user_enrollment", args=(enrollment.pk,)))
         self.assertEqual(response.status_code, 200)
@@ -137,11 +161,15 @@ class MDMUserEnrollmentSetupViewsTestCase(TestCase):
         self.assertContains(response, f"[USER] {enrollment.name}")
 
     def test_update_user_enrollment_post(self):
-        enrollment = force_user_enrollment(self.mbu, None)
+        enrollment = force_user_enrollment(self.mbu)
         self._login("mdm.change_userenrollment", "mdm.view_userenrollment")
+        new_realm = force_realm()
         new_name = get_random_string(64)
+        new_display_name = get_random_string(12)
         response = self.client.post(reverse("mdm:update_user_enrollment", args=(enrollment.pk,)),
-                                    {"ue-name": new_name,
+                                    {"ue-realm": new_realm.pk,
+                                     "ue-name": new_name,
+                                     "ue-display_name": new_display_name,
                                      "ue-scep_config": enrollment.scep_config.pk,
                                      "ue-scep_verification": "on",
                                      "ue-push_certificate": enrollment.push_certificate.pk,
@@ -149,12 +177,16 @@ class MDMUserEnrollmentSetupViewsTestCase(TestCase):
                                     follow=True)
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "mdm/userenrollment_detail.html")
+        self.assertContains(response, new_realm.name)
         self.assertContains(response, new_name)
+        self.assertContains(response, new_display_name)
         self.assertContains(response, enrollment.push_certificate.name)
         self.assertContains(response, enrollment.scep_config.name)
         self.assertContains(response, "with CSR verification")
         enrollment = response.context["object"]
+        self.assertEqual(enrollment.realm, new_realm)
         self.assertEqual(enrollment.name, new_name)
+        self.assertEqual(enrollment.display_name, new_display_name)
 
     # list User enrollments
 
@@ -162,7 +194,7 @@ class MDMUserEnrollmentSetupViewsTestCase(TestCase):
         self._login_redirect(reverse("mdm:enrollments"))
 
     def test_list_user_enrollments_no_perm_empty(self):
-        enrollment = force_user_enrollment(self.mbu, None)
+        enrollment = force_user_enrollment(self.mbu)
         self._login()
         response = self.client.get(reverse("mdm:enrollments"))
         self.assertEqual(response.status_code, 200)
@@ -170,9 +202,9 @@ class MDMUserEnrollmentSetupViewsTestCase(TestCase):
         self.assertNotContains(response, enrollment.name)
 
     def test_list_user_enrollments(self):
-        enrollment = force_user_enrollment(self.mbu, None)
+        enrollment = force_user_enrollment(self.mbu)
         self._login("mdm.view_userenrollment")
         response = self.client.get(reverse("mdm:enrollments"))
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "1 User enrollment")
+        self.assertContains(response, "User enrollment (1)")
         self.assertContains(response, enrollment.name)

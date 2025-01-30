@@ -1032,13 +1032,13 @@ class ComputerNameFilter(BaseMSFilter):
     def wheres(self):
         if self.value:
             if self.value != self.none_value:
-                yield "si.id is not null and si.computer_name ~* %s"
+                yield "si.id IS NOT NULL AND UPPER(si.computer_name) LIKE UPPER(%s)"
             else:
-                yield "si.id is null or si.computer_name is null"
+                yield "si.id IS NULL or si.computer_name IS NULL"
 
     def where_args(self):
         if self.value and self.value != self.none_value:
-            yield self.value
+            yield "%{}%".format(connection.ops.prep_for_like_query(self.value))
 
     def process_fetched_record(self, record, for_filtering):
         computer_name = record.pop("computer_name", None)
@@ -1065,14 +1065,21 @@ class PrincipalUserNameFilter(BaseMSFilter):
     def wheres(self):
         if self.value:
             if self.value != self.none_value:
-                yield "pu.id is not null and (pu.principal_name ~* %s or pu.display_name ~* %s)"
+                yield (
+                    "pu.id IS NOT NULL "
+                    "AND (UPPER(pu.principal_name) LIKE UPPER(%s) OR UPPER(pu.display_name) LIKE UPPER(%s))"
+                )
             else:
-                yield "pu.id is null or pu.principal_name is null"
+                yield (
+                    "pu.id IS NULL OR "
+                    "(pu.principal_name IS NULL AND pu.display_name IS NULL)"
+                )
 
     def where_args(self):
         if self.value and self.value != self.none_value:
-            yield self.value
-            yield self.value
+            prepared_value = "%{}%".format(connection.ops.prep_for_like_query(self.value))
+            yield prepared_value
+            yield prepared_value
 
     def process_fetched_record(self, record, for_filtering):
         for attr in ("principal_name", "display_name"):
@@ -1229,15 +1236,17 @@ class IncidentSeverityFilter(BaseMSFilter):
     severities_dict = dict(Severity.choices())
 
     def joins(self):
+        open_values = tuple(Status.open_values())
         yield (
-            "left join ("
-            "select mi.serial_number as serial_number, max(i.severity) as max_incident_severity "
-            "from incidents_machineincident as mi "
-            "join incidents_incident as i on (i.id = mi.incident_id) "
-            "where i.status in ({}) "
-            "group by mi.serial_number"
-            ") as mis on (mis.serial_number = ms.serial_number)"
-        ).format(",".join("'{}'".format(s) for s in Status.open_values()))
+            ("left join ("
+             "select mi.serial_number as serial_number, max(i.severity) as max_incident_severity "
+             "from incidents_machineincident as mi "
+             "join incidents_incident as i on (i.id = mi.incident_id) "
+             "where i.status in %s and mi.status in %s "
+             "group by mi.serial_number"
+             ") as mis on (mis.serial_number = ms.serial_number)"),
+            [open_values, open_values]
+        )
 
     def wheres(self):
         if self.value:
@@ -1438,7 +1447,6 @@ class EC2InstanceTypeFilter(BaseMSFilter):
 
 
 class MSQuery:
-    paginate_by = 50
     itersize = 1000
     default_filters = [
         DateTimeFilter,
@@ -1462,8 +1470,9 @@ class MSQuery:
         EC2InstanceTypeFilter,
     ]
 
-    def __init__(self, query_dict=None):
+    def __init__(self, query_dict=None, paginate_by=50):
         self.query_dict = query_dict or {}
+        self.paginate_by = paginate_by
         try:
             self.page = int(self.query_dict.get("page", 1))
         except ValueError:
@@ -1926,9 +1935,7 @@ class MSQuery:
 
 
 class AndroidAppFilterForm(forms.Form):
-    display_name = forms.CharField(label="Android app name", required=False,
-                                   widget=forms.TextInput(attrs={"class": "form-control",
-                                                                 "placeholder": "Android app name"}))
+    display_name = forms.CharField(label="Android app name", required=False)
 
     def __init__(self, *args, **kwargs):
         self.msquery = kwargs.pop("msquery")
@@ -1945,12 +1952,8 @@ class AndroidAppFilterForm(forms.Form):
 
 
 class BundleFilterForm(forms.Form):
-    bundle_id = forms.CharField(label="Bundle ID", required=False,
-                                widget=forms.TextInput(attrs={"class": "form-control",
-                                                              "placeholder": "Bundle ID"}))
-    bundle_name = forms.CharField(label="Bundle name", required=False,
-                                  widget=forms.TextInput(attrs={"class": "form-control",
-                                                                "placeholder": "Bundle name"}))
+    bundle_id = forms.CharField(label="Bundle ID", required=False)
+    bundle_name = forms.CharField(label="Bundle name", required=False)
 
     def __init__(self, *args, **kwargs):
         self.msquery = kwargs.pop("msquery")
@@ -1975,9 +1978,7 @@ class BundleFilterForm(forms.Form):
 
 
 class DebPackageFilterForm(forms.Form):
-    name = forms.CharField(label="Debian package name", required=False,
-                           widget=forms.TextInput(attrs={"class": "form-control",
-                                                         "placeholder": "Debian package name"}))
+    name = forms.CharField(label="Debian package name", required=False)
 
     def __init__(self, *args, **kwargs):
         self.msquery = kwargs.pop("msquery")
@@ -1994,9 +1995,7 @@ class DebPackageFilterForm(forms.Form):
 
 
 class IOSAppFilterForm(forms.Form):
-    name = forms.CharField(label="iOS app name", required=False,
-                           widget=forms.TextInput(attrs={"class": "form-control",
-                                                         "placeholder": "iOS app name"}))
+    name = forms.CharField(label="iOS app name", required=False)
 
     def __init__(self, *args, **kwargs):
         self.msquery = kwargs.pop("msquery")
@@ -2013,9 +2012,7 @@ class IOSAppFilterForm(forms.Form):
 
 
 class ProgramFilterForm(forms.Form):
-    name = forms.CharField(label="Program name", required=False,
-                           widget=forms.TextInput(attrs={"class": "form-control",
-                                                         "placeholder": "Program name"}))
+    name = forms.CharField(label="Program name", required=False)
 
     def __init__(self, *args, **kwargs):
         self.msquery = kwargs.pop("msquery")
@@ -2033,7 +2030,7 @@ class ProgramFilterForm(forms.Form):
 
 class ComplianceCheckStatusFilterForm(forms.Form):
     compliance_check = forms.ModelChoiceField(queryset=ComplianceCheck.objects.all(),
-                                              widget=forms.Select(attrs={'class': 'form-control'}))
+                                              empty_label='...')
 
     def __init__(self, *args, **kwargs):
         self.msquery = kwargs.pop("msquery")
@@ -2087,11 +2084,7 @@ def osx_app_count(source_names, bundle_ids=None, bundle_names=None):
     cursor.execute(query, query_args)
     columns = [col.name for col in cursor.description]
     for row in cursor.fetchall():
-        d = dict(zip(columns, row))
-        for k, v in d.items():
-            if v is None:
-                d[k] = '_'
-        yield d
+        yield dict(zip(columns, row))
 
 
 def program_count(source_names, program_names):
@@ -2122,11 +2115,7 @@ def program_count(source_names, program_names):
                            tuple(n for n in program_names)])
     columns = [col.name for col in cursor.description]
     for row in cursor.fetchall():
-        d = dict(zip(columns, row))
-        for k, v in d.items():
-            if v is None:
-                d[k] = '_'
-        yield d
+        yield dict(zip(columns, row))
 
 
 def android_app_count(source_names, names):
@@ -2156,11 +2145,7 @@ def android_app_count(source_names, names):
                            tuple(n for n in names)])
     columns = [col.name for col in cursor.description]
     for row in cursor.fetchall():
-        d = dict(zip(columns, row))
-        for k, v in d.items():
-            if v is None:
-                d[k] = '_'
-        yield d
+        yield dict(zip(columns, row))
 
 
 def deb_package_count(source_names, package_names):
@@ -2191,11 +2176,7 @@ def deb_package_count(source_names, package_names):
                            tuple(n for n in package_names)])
     columns = [col.name for col in cursor.description]
     for row in cursor.fetchall():
-        d = dict(zip(columns, row))
-        for k, v in d.items():
-            if v is None:
-                d[k] = '_'
-        yield d
+        yield dict(zip(columns, row))
 
 
 def ios_app_count(source_names, names):
@@ -2225,17 +2206,13 @@ def ios_app_count(source_names, names):
                            tuple(n for n in names)])
     columns = [col.name for col in cursor.description]
     for row in cursor.fetchall():
-        d = dict(zip(columns, row))
-        for k, v in d.items():
-            if v is None:
-                d[k] = '_'
-        yield d
+        yield dict(zip(columns, row))
 
 
 def os_version_count(source_names):
     query = (
         "with all_os_versions as ("
-        "  select o.name, o.major, o.minor, o.patch, o.build,"
+        "  select o.name, o.major, o.minor, o.patch, o.build, o.version,"
         "  s.id as source_id, s.name as source_name,"
         "  ms.platform as platform,"
         "  date_part('days', now() - cms.last_seen) as age"
@@ -2244,7 +2221,7 @@ def os_version_count(source_names):
         "  join inventory_currentmachinesnapshot as cms on (cms.machine_snapshot_id = ms.id)"
         "  join inventory_source as s on (s.id = cms.source_id)"
         "  where LOWER(s.name) in %s"
-        ") select name, major, minor, patch, build, source_id, source_name, platform,"
+        ") select name, major, minor, patch, build, version, source_id, source_name, platform,"
         'count(*) filter (where age < 1) as "1",'
         'count(*) filter (where age < 7) as "7",'
         'count(*) filter (where age < 14) as "14",'
@@ -2253,17 +2230,13 @@ def os_version_count(source_names):
         'count(*) filter (where age < 90) as "90",'
         'count(*) as "+Inf" '
         "from all_os_versions "
-        "group by name, major, minor, patch, build, source_id, source_name, platform"
+        "group by name, major, minor, patch, build, version, source_id, source_name, platform"
     )
     cursor = connection.cursor()
     cursor.execute(query, [tuple(n.lower() for n in source_names)])
     columns = [col.name for col in cursor.description]
     for row in cursor.fetchall():
-        d = dict(zip(columns, row))
-        for k, v in d.items():
-            if v is None:
-                d[k] = '_'
-        yield d
+        yield dict(zip(columns, row))
 
 
 def active_machines_count(source_names):
@@ -2290,11 +2263,7 @@ def active_machines_count(source_names):
     cursor.execute(query, [tuple(n.lower() for n in source_names)])
     columns = [col.name for col in cursor.description]
     for row in cursor.fetchall():
-        d = dict(zip(columns, row))
-        for k, v in d.items():
-            if v is None:
-                d[k] = '_'
-        yield d
+        yield dict(zip(columns, row))
 
 
 def inventory_events_from_machine_snapshot_commit(machine_snapshot_commit):
@@ -2309,7 +2278,7 @@ def inventory_events_from_machine_snapshot_commit(machine_snapshot_commit):
                    exclude=["deb_packages",
                             "disks",
                             "network_interfaces",
-                            "osx_app_instance",
+                            "osx_app_instances",
                             "program_instances"]
                ))
         yield ('inventory_heartbeat',

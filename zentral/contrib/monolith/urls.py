@@ -3,35 +3,46 @@ from . import views
 
 app_name = "monolith"
 urlpatterns = [
+    # index
+    path('', views.IndexView.as_view(), name='index'),
+
+    # repositories
+    path('repositories/', views.RepositoriesView.as_view(), name='repositories'),
+    path('repositories/create/', views.CreateRepositoryView.as_view(), name='create_repository'),
+    path('repositories/<int:pk>/', views.RepositoryView.as_view(), name='repository'),
+    path('repositories/<int:pk>/update/', views.UpdateRepositoryView.as_view(), name='update_repository'),
+    path('repositories/<int:pk>/delete/', views.DeleteRepositoryView.as_view(), name='delete_repository'),
+    path('repositories/<int:pk>/sync/', views.SyncRepositoryView.as_view(), name='sync_repository'),
+
     # pkg infos
-    path('pkg_infos/', views.PkgInfosView.as_view(), name='pkg_infos'),
-    path('pkg_infos/<int:pk>/update_catalog/',
+    path('pkginfos/', views.PkgInfosView.as_view(), name='pkg_infos'),
+    path('pkginfos/<int:pk>/', views.PkgInfoNameView.as_view(), name='pkg_info'),
+    path('pkginfos/upload_package/', views.UploadPackageView.as_view(), name='upload_package'),
+    path('pkginfos/<int:pk>/update_package/', views.UpdatePackageView.as_view(), name='update_package'),
+    path('pkginfos/<int:pk>/update_catalog/',
          views.UpdatePkgInfoCatalogView.as_view(),
          name='update_pkg_info_catalog'),
-    path('pkg_info_names/<int:pk>/', views.PkgInfoNameView.as_view(), name='pkg_info_name'),
-    path('pkg_info_names/<int:pk>/events/',
+    path('pkginfos/<int:pk>/delete/', views.DeletePkgInfoView.as_view(), name='delete_pkg_info'),
+
+    # pkg info names
+    path('pkginfo_names/create/', views.CreatePkgInfoNameView.as_view(), name='create_pkg_info_name'),
+    path('pkginfo_names/<int:pk>/', views.PkgInfoNameView.as_view(), name='pkg_info_name'),
+    path('pkginfo_names/<int:pk>/events/',
          views.PkgInfoNameEventsView.as_view(),
          name='pkg_info_name_events'),
-    path('pkg_info_names/<int:pk>/events/fetch/',
+    path('pkginfo_names/<int:pk>/events/fetch/',
          views.FetchPkgInfoNameEventsView.as_view(),
          name='fetch_pkg_info_name_events'),
-    path('pkg_info_names/<int:pk>/events/store_redirect/',
+    path('pkginfo_names/<int:pk>/events/store_redirect/',
          views.PkgInfoNameEventsStoreRedirectView.as_view(),
          name='pkg_info_name_events_store_redirect'),
-
-    # PPDs
-    path('ppds/', views.PPDsView.as_view(), name='ppds'),
-    path('ppds/upload/', views.UploadPPDView.as_view(), name='upload_ppd'),
-    path('ppds/<int:pk>/', views.PPDView.as_view(), name='ppd'),
+    path('pkginfo_names/<int:pk>/delete/', views.DeletePkgInfoNameView.as_view(), name='delete_pkg_info_name'),
 
     # catalogs
     path('catalogs/', views.CatalogsView.as_view(), name='catalogs'),
     path('catalogs/create/', views.CreateCatalogView.as_view(), name='create_catalog'),
     path('catalogs/<int:pk>/', views.CatalogView.as_view(), name='catalog'),
     path('catalogs/<int:pk>/update/', views.UpdateCatalogView.as_view(), name='update_catalog'),
-    path('catalogs/<int:pk>/update_priority/',
-         views.UpdateCatalogPriorityView.as_view(),
-         name='update_catalog_priority'),
     path('catalogs/<int:pk>/delete/', views.DeleteCatalogView.as_view(), name='delete_catalog'),
 
     # conditions
@@ -53,18 +64,6 @@ urlpatterns = [
          views.UpdateSubManifestPkgInfoView.as_view(), name='update_sub_manifest_pkg_info'),
     path('sub_manifests/<int:sm_pk>/pkg_infos/<int:pk>/delete/',
          views.DeleteSubManifestPkgInfoView.as_view(), name='delete_sub_manifest_pkg_info'),
-    path('sub_manifests/<int:pk>/add_attachment/',
-         views.SubManifestAddAttachmentView.as_view(), name='sub_manifest_add_attachment'),
-    path('sub_manifests/<int:pk>/add_script/',
-         views.SubManifestAddScriptView.as_view(), name='sub_manifest_add_script'),
-    path('sub_manifests/<int:sm_pk>/script/<int:pk>/update/',
-         views.SubManifestUpdateScriptView.as_view(), name='sub_manifest_update_script'),
-    path('sub_manifests_attachment/<int:pk>/delete/',
-         views.DeleteSubManifestAttachmentView.as_view(), name='delete_sub_manifest_attachment'),
-    path('sub_manifests_attachment/<int:pk>/purge/',
-         views.PurgeSubManifestAttachmentView.as_view(), name='purge_sub_manifest_attachment'),
-    path('sub_manifests_attachment/<int:pk>/download/',
-         views.DownloadSubManifestAttachmentView.as_view(), name='download_sub_manifest_attachment'),
 
     # manifests
     path('manifests/', views.ManifestsView.as_view(), name='manifests'),
@@ -74,12 +73,6 @@ urlpatterns = [
     path('manifests/<int:pk>/add_enrollment/',
          views.AddManifestEnrollmentView.as_view(),
          name="add_manifest_enrollment"),
-    path('manifests/<int:manifest_pk>/enrollment/<int:pk>/configuration_plist/',
-         views.ManifestEnrollmentConfigurationProfileView.as_view(format="plist"),
-         name="manifest_enrollment_configuration_plist"),
-    path('manifests/<int:manifest_pk>/enrollment/<int:pk>/configuration_profile/',
-         views.ManifestEnrollmentConfigurationProfileView.as_view(format="configuration_profile"),
-         name="manifest_enrollment_configuration_profile"),
 
     # manifest machine info
     path('manifests/<int:pk>/machine_info/', views.ManifestMachineInfoView.as_view(), name='manifest_machine_info'),
@@ -100,14 +93,6 @@ urlpatterns = [
     path('manifests/<int:pk>/delete_enrollment_package/<int:mep_pk>/',
          views.DeleteManifestEnrollmentPackageView.as_view(), name='delete_manifest_enrollment_package'),
 
-    # manifest printers
-    path('manifests/<int:m_pk>/add_printer/',
-         views.AddManifestPrinterView.as_view(), name='add_manifest_printer'),
-    path('manifests/<int:m_pk>/printers/<int:pk>/update/',
-         views.UpdateManifestPrinterView.as_view(), name='update_manifest_printer'),
-    path('manifests/<int:m_pk>/printers/<int:pk>/delete/',
-         views.DeleteManifestPrinterView.as_view(), name='delete_manifest_printer'),
-
     # manifest sub manifests
     path('manifests/<int:pk>/sub_manifests/add/',
          views.AddManifestSubManifestView.as_view(), name='add_manifest_sub_manifest'),
@@ -120,32 +105,22 @@ urlpatterns = [
     path('manifests/<int:pk>/delete_cache_server/<int:cs_pk>/',
          views.DeleteManifestCacheServerView.as_view(), name='delete_manifest_cache_server'),
 
-    # extra
-    path('download_printer_ppd/<str:token>/', views.DownloadPrinterPPDView.as_view(),
-         name='download_printer_ppd'),
-
-    # managedsoftwareupdate API
-    path('munki_repo/catalogs/<path:name>',
-         views.MRCatalogView.as_view(), name='repository_catalog'),
-    path('munki_repo/manifests/<path:name>',
-         views.MRManifestView.as_view(), name='repository_manifest'),
-    path('munki_repo/pkgs/<path:name>',
-         views.MRPackageView.as_view(), name='repository_package'),
-    path('munki_repo/icons/<path:name>',
-         views.MRRedirectView.as_view(section="icons"), name='repository_icon'),
-    path('munki_repo/client_resources/<path:name>',
-         views.MRRedirectView.as_view(section="client_resources"), name='repository_client_resource'),
+    # terraform
+    path('terraform_export/',
+         views.TerraformExportView.as_view(),
+         name='terraform_export'),
 ]
 
 
-main_menu_cfg = {
-    'weight': 10,
+modules_menu_cfg = {
     'items': (
+        ('index', 'Overview', False, ("monolith",)),
+        ('repositories', 'Repositories', False, ("monolith.view_repository",)),
         ('catalogs', 'Catalogs', False, ("monolith.view_catalog",)),
         ('pkg_infos', 'PkgInfos', False, ("monolith.view_pkginfo",)),
-        ('ppds', 'Printer PPDs', False, ("monolith.view_printerppd",)),
         ('conditions', 'Conditions', False, ("monolith.view_condition",)),
         ('manifests', 'Manifests', False, ("monolith.view_manifest",)),
         ('sub_manifests', 'Sub manifests', False, ("monolith.view_submanifest",)),
-    )
+    ),
+    'weight': 20,
 }

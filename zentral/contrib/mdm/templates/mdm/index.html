@@ -1,10 +1,10 @@
 {% extends 'base.html' %}
-{% load bootstrap %}
+{% load ui_extras %}
 
 {% block content %}
 <ol class="breadcrumb">
-  <li><a href="/">Home</a></li>
-  <li class="active">MDM</li>
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item active">MDM</li>
 </ol>
 
 <h2>MDM</h2>
@@ -15,7 +15,10 @@
 <p><a href="{% url 'mdm:enrollments' %}">Enrollments</a></p>
 {% endif %}
 {% if perms.mdm.view_enrolleddevice %}
-<p><a href="{% url 'mdm:enrolled_devices' %}">Devices</a></p>
+<p><a href="{% url 'mdm:enrolled_devices' %}">Enrolled devices</a></p>
+{% endif %}
+{% if perms.mdm.view_depdevice %}
+<p><a href="{% url 'mdm:dep_devices' %}">DEP devices</a></p>
 {% endif %}
 {% if perms.mdm.view_artifact %}
 <p><a href="{% url 'mdm:artifacts' %}">Artifacts</a></p>
@@ -26,11 +29,31 @@
 {% if perms.mdm.view_blueprint %}
 <p><a href="{% url 'mdm:blueprints' %}">Blueprints</a></p>
 {% endif %}
+{% if perms.mdm.view_filevaultconfig %}
+<p><a href="{% url 'mdm:filevault_configs' %}">FileVault configurations</a></p>
+{% endif %}
+{% if perms.mdm.view_recoverypasswordconfig %}
+<p><a href="{% url 'mdm:recovery_password_configs' %}">Recovery password configurations</a></p>
+{% endif %}
+{% if perms.mdm.view_softwareupdateenforcement %}
+<p><a href="{% url 'mdm:software_update_enforcements' %}">Software update enforcements</a></p>
+{% endif %}
 {% if perms.mdm.view_scepconfig %}
 <p><a href="{% url 'mdm:scep_configs' %}">SCEP configurations</a></p>
 {% endif %}
+{% if perms.mdm.view_realmgrouptagmapping %}
+<p><a href="{% url 'mdm:realm_group_tag_mappings' %}">Group → Tag mappings</a></p>
+{% endif %}
 
-<h3>Setup</h3>
+<div class="d-flex align-items-center mb-1">
+    <h3 class="m-0">Setup</h3>
+    <div class="me-auto">
+        {% if show_terraform_export %}
+            {% url 'mdm:terraform_export' as url %}
+            {% button 'DOWNLOAD' url "Download Terraform Config" %}
+        {% endif %}
+    </div>
+</div>
 {% if perms.mdm.view_pushcertificate %}
 <p><a href="{% url 'mdm:push_certificates' %}">Push certificates</a></p>
 {% endif %}
@@ -41,4 +64,5 @@
 <p><a href="{% url 'mdm:locations' %}">Locations</a></p>
 {% endif %}
 <p><a href="{% url 'mdm:root_ca' %}">Trusted Root CA configuration profile</a></p>
+
 {% endblock %}

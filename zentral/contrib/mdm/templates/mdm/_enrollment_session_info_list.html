@@ -1,4 +1,4 @@
-<table class="table table-condensed">
+<table class="table table-striped align-middle">
   <thead>
     <th class="col-md-2">type</th>
     <th class="col-md-2">enrollment</th>
@@ -52,10 +52,25 @@
       </td>
       {% endif %}
       <td>
-        {% if session.realm_username %}{{ session.realm_username }}{% else %}-{% endif %}
+        {% if session.realm_username %}
+        {% if perms.realms.view_realmuser %}
+        <a href="{% url 'realms:user' session.realm_user_id %}">{{ session.realm_username }}</a>
+        {% else %}
+        {{ session.realm_username }}
+        {% endif %}
+        {% else %}
+        -
+        {% endif %}
       </td>
-      <td class="{% if session.status == "COMPLETED" %}bg-success{% else %}bg-warning{% endif %}">
-        {{ session.status|title }}
+      <td>
+        <span 
+        {% if session.status == "COMPLETED" %}
+            class="badge text-bg-success">
+        {% else %}
+            class="badge text-bg-warning">
+        {% endif %}
+            {{ session.status|title }}
+        </span>
       </td>
       <td>{{ session.created_at|date:"SHORT_DATETIME_FORMAT" }}</td>
       <td>{{ session.updated_at|date:"SHORT_DATETIME_FORMAT" }}</td>

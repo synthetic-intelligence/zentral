@@ -2,11 +2,15 @@ from datetime import datetime, timedelta
 from django import forms
 from django.db.models import Count, F, Q
 from django.utils.text import slugify
+from rest_framework.parsers import JSONParser
+from rest_framework_yaml.parsers import YAMLParser
 from .compliance_checks import sync_query_compliance_check
 from .models import (AutomaticTableConstruction, Configuration, ConfigurationPack,
                      DistributedQuery, DistributedQueryMachine, Enrollment, FileCategory,
                      Pack, PackQuery, Platform, Query)
+from .packs import OsqueryConfigParser, update_or_create_pack
 from .releases import get_osquery_versions
+from .serializers import OsqueryPackSerializer
 
 
 # common
@@ -27,7 +31,10 @@ class ATCForm(forms.ModelForm):
     class Meta:
         model = AutomaticTableConstruction
         fields = "__all__"
-        widgets = {"platforms": PlatformsWidget}
+        widgets = {
+            "platforms": PlatformsWidget,
+            "description": forms.Textarea(attrs={"rows": "2"})
+        }
 
 
 # Configuration
@@ -115,6 +122,8 @@ class DistributedQueryForm(forms.ModelForm):
 
 
 class DistributedQueryMachineSearchForm(forms.Form):
+    template_name = "django/forms/search.html"
+
     serial_number = forms.CharField(
         label="Serial number", required=False,
         widget=forms.TextInput(attrs={"autofocus": True,
@@ -190,6 +199,9 @@ class FileCategoryForm(forms.ModelForm):
     class Meta:
         model = FileCategory
         fields = "__all__"
+        widgets = {
+            "description": forms.Textarea(attrs={"rows": "2"})
+        }
 
     def clean(self):
         super().clean()
@@ -211,9 +223,9 @@ class PackForm(forms.ModelForm):
     class Meta:
         model = Pack
         fields = "__all__"
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        widgets = {
+            "description": forms.Textarea(attrs={"rows": "2"})
+        }
 
     def clean(self):
         super().clean()
@@ -227,6 +239,52 @@ class PackForm(forms.ModelForm):
                 self.add_error("name", f"A pack with the slug '{slug}' already exists")
             else:
                 self.instance.slug = slug
+
+
+class UploadPackForm(forms.ModelForm):
+    file = forms.FileField()
+    update_and_create_only = forms.BooleanField(label="Only update and create queries",
+                                                help_text="If true, the existing queries not present in the uploaded "
+                                                          "file will not be removed from the pack.",
+                                                required=False, initial=True)
+
+    class Meta:
+        model = Pack
+        fields = []
+
+    def clean(self):
+        update_and_create_only = self.cleaned_data.get("update_and_create_only")
+        if update_and_create_only:
+            self.cleaned_data["delete_extra_queries"] = False
+        else:
+            self.cleaned_data["delete_extra_queries"] = True
+        file = self.cleaned_data.get("file")
+        if file:
+            for parser in (OsqueryConfigParser, JSONParser, YAMLParser):
+                try:
+                    data = parser().parse(file)
+                except Exception:
+                    file.seek(0)
+                else:
+                    self.cleaned_data["data"] = data
+                    break
+            else:
+                self.add_error("file", "Could not parse pack file.")
+                return
+            serializer = OsqueryPackSerializer(data=data)
+            if not serializer.is_valid():
+                self.add_error(
+                    "file",
+                    ", ".join("{}: {}".format(k, ", ".join(v)) for k, v in serializer.errors.items())
+                )
+
+    def save(self, request):
+        return update_or_create_pack(
+            request,
+            self.cleaned_data["data"],
+            pack=self.instance,
+            delete_extra_queries=self.cleaned_data["delete_extra_queries"],
+        )
 
 
 # Pack query
@@ -259,13 +317,13 @@ class PackQueryForm(forms.ModelForm):
         self.instance.pack = self.pack
         query = self.cleaned_data.get("query")
         if query:
-            slug = slugify(query.name)
-            if PackQuery.objects.filter(slug=slug).exists():
-                slug = f"{slug}-{query.id}"
-            self.instance.slug = slug
+            if not self.instance.pk:
+                slug = slugify(query.name)
+                if PackQuery.objects.filter(pack=self.pack, slug=slug).exists():
+                    slug = f"{slug}-{query.id}"
+                self.instance.slug = slug
             if query.compliance_check and not self.cleaned_data.get("snapshot_mode"):
                 self.add_error("snapshot_mode", "A compliance check query can only be scheduled in 'snapshot' mode.")
-
 
 
 # Query
@@ -293,13 +351,20 @@ class QueryForm(forms.ModelForm):
         return sql
 
     def clean(self):
-        if self.cleaned_data.get("compliance_check"):
+        compliance_check = self.cleaned_data.get("compliance_check")
+        tag = self.cleaned_data.get("tag")
+        if tag and compliance_check:
+            err = "A query can either be a compliance check or a tag update, not both"
+            self.add_error("compliance_check", err)
+            self.add_error("tag", err)
+        if compliance_check:
             sql = self.cleaned_data.get("sql")
             if sql and "ztl_status" not in sql:
                 self.add_error(
                     "compliance_check",
                     "The query doesn't contain the 'ztl_status' keyword"
                 )
+        if compliance_check or tag:
             try:
                 pack_query = self.instance.packquery
             except PackQuery.DoesNotExist:
@@ -307,7 +372,7 @@ class QueryForm(forms.ModelForm):
             else:
                 if not pack_query.snapshot_mode:
                     self.add_error(
-                        "compliance_check",
+                        "tag" if tag else "compliance_check",
                         f"This query is scheduled in 'diff' mode in the {pack_query.pack} pack"
                     )
 
@@ -318,19 +383,33 @@ class QueryForm(forms.ModelForm):
 
 
 class QuerySearchForm(forms.Form):
+    template_name = "django/forms/search.html"
+
     q = forms.CharField(
-        label="Query", required=False,
-        widget=forms.TextInput(attrs={"autofocus": True,
-                                      "size": 36,
-                                      "placeholder": "Query name, pack name, SQL, …"})
+            label="Query name, pack name, SQL, …",
+            required=False,
+            widget=forms.TextInput(
+                attrs={
+                    "autofocus": True,
+                    "size": 36,
+                }
+            )
     )
-    pack = forms.ModelChoiceField(queryset=Pack.objects.all(), required=False)
-    compliance_check = forms.BooleanField(label="Only compliance checks", required=False)
+    pack = forms.ModelChoiceField(
+            label="Pack",
+            queryset=Pack.objects.all(),
+            required=False,
+            empty_label='...',
+    )
+    compliance_check = forms.BooleanField(
+        label="Compliance checks",
+        required=False,
+    )
 
     def get_queryset(self):
         qs = (
             Query.objects
-                 .select_related("compliance_check")
+                 .select_related("compliance_check", "tag__taxonomy")
                  .prefetch_related("packquery__pack")
                  .annotate(distributed_query_count=Count("distributedquery"))
                  .order_by("name", "pk")
@@ -349,4 +428,6 @@ class QuerySearchForm(forms.Form):
             qs = qs.filter(packquery__pack=pack)
         if self.cleaned_data.get("compliance_check"):
             qs = qs.filter(compliance_check__isnull=False)
+        if self.cleaned_data.get("tag_update"):
+            qs = qs.filter(tag__isnull=False)
         return qs

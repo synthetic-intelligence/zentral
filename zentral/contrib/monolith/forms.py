@@ -1,28 +1,70 @@
 from django import forms
-from django.db import IntegrityError, transaction
-from django.db.models import F, Max, Q
+from django.db.models import Q
 from zentral.contrib.inventory.models import MetaBusinessUnit, Tag
-from .attachments import MobileconfigFile, PackageFile
+from .attachments import PackageFile
 from .exceptions import AttachmentError
 from .models import (Catalog, Enrollment,
                      Manifest, ManifestCatalog, ManifestSubManifest,
-                     Printer, PrinterPPD,
-                     PkgInfoName, SubManifest,
-                     SubManifestPkgInfo, SubManifestAttachment)
-from .ppd import get_ppd_information
+                     PkgInfo, PkgInfoCategory, PkgInfoName,
+                     Repository,
+                     SubManifest, SubManifestPkgInfo)
+
+
+class RepositoryForm(forms.ModelForm):
+    class Meta:
+        model = Repository
+        fields = "__all__"
+
+    def clean_meta_business_unit(self):
+        mbu = self.cleaned_data.get("meta_business_unit")
+        if mbu and self.instance.pk:
+            for manifest in self.instance.manifests():
+                if manifest.meta_business_unit != mbu:
+                    raise forms.ValidationError(
+                        f"Repository linked to manifest '{manifest}' which has a different business unit."
+                    )
+        return mbu
+
+
+class CatalogForm(forms.ModelForm):
+    class Meta:
+        model = Catalog
+        fields = "__all__"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["repository"].queryset = Repository.objects.for_manual_catalogs()
+
+    def clean_repository(self):
+        repository = self.cleaned_data.get("repository")
+        if repository and repository.meta_business_unit and self.instance.pk:
+            if (
+                Manifest.objects.filter(manifestcatalog__catalog=self.instance)
+                                .exclude(meta_business_unit=repository.meta_business_unit)
+                                .count()
+            ):
+                raise forms.ValidationError(
+                    "This catalog is included in manifests linked to different business units than this repository."
+                )
+        return repository
 
 
 class PkgInfoSearchForm(forms.Form):
+    template_name = "django/forms/search.html"
+
     name = forms.CharField(label="Name", required=False,
-                           widget=forms.TextInput(attrs={"placeholder": "name"}))
-    catalog = forms.ModelChoiceField(queryset=Catalog.objects.filter(archived_at__isnull=True),
-                                     required=False)
+                           widget=forms.TextInput(attrs={"autofocus": True}))
+    catalog = forms.ModelChoiceField(
+        queryset=Catalog.objects.filter(archived_at__isnull=True),
+        empty_label="...",
+        required=False)
 
     def is_initial(self):
         return not {k: v for k, v in self.cleaned_data.items() if v}
 
 
 class ManifestForm(forms.ModelForm):
+
     class Meta:
         model = Manifest
         fields = ('meta_business_unit', 'name')
@@ -35,8 +77,10 @@ class ManifestForm(forms.ModelForm):
 
 
 class ManifestSearchForm(forms.Form):
+    template_name = "django/forms/search.html"
+
     name = forms.CharField(label="Name", required=False,
-                           widget=forms.TextInput(attrs={"autofocus": "true",
+                           widget=forms.TextInput(attrs={"autofocus": True,
                                                          "size": 32,
                                                          "placeholder": "Name or business unit name"}))
 
@@ -49,8 +93,10 @@ class ManifestSearchForm(forms.Form):
 
 
 class SubManifestSearchForm(forms.Form):
+    template_name = "django/forms/search.html"
+
     keywords = forms.CharField(label="Keywords", required=False,
-                               widget=forms.TextInput(attrs={"placeholder": "Keywords…"}))
+                               widget=forms.TextInput(attrs={"autofocus": True, "placeholder": "Keywords…"}))
 
     def get_queryset(self):
         qs = SubManifest.objects.select_related("meta_business_unit").all()
@@ -59,8 +105,7 @@ class SubManifestSearchForm(forms.Form):
             qs = qs.distinct().filter(Q(name__icontains=keywords)
                                       | Q(description__icontains=keywords)
                                       | Q(meta_business_unit__name__icontains=keywords)
-                                      | Q(submanifestpkginfo__pkg_info_name__name__icontains=keywords)
-                                      | Q(submanifestattachment__name__icontains=keywords))
+                                      | Q(submanifestpkginfo__pkg_info_name__name__icontains=keywords))
         return qs
 
 
@@ -68,6 +113,9 @@ class SubManifestForm(forms.ModelForm):
     class Meta:
         model = SubManifest
         fields = ('meta_business_unit', 'name', 'description')
+        widgets = {
+            "description": forms.Textarea(attrs={"rows": "2"})
+        }
 
     def clean_meta_business_unit(self):
         mbu = self.cleaned_data.get("meta_business_unit")
@@ -135,7 +183,7 @@ class SubManifestPkgInfoForm(SubManifestItemFormMixin, forms.ModelForm):
         self.tag_shards = []
         existing_tag_shard_dict = {}
         if self.instance.pk:
-            existing_tag_shard_dict = dict(self.instance.tag_shards)
+            existing_tag_shard_dict = {ts["tag"]: ts["shard"] for ts in self.instance.tag_shards}
         for tag in tag_qs:
             self.tag_shards.append(
                 (tag, tag in existing_tag_shard_dict, existing_tag_shard_dict.get(tag, self.instance.shard_modulo))
@@ -151,7 +199,7 @@ class SubManifestPkgInfoForm(SubManifestItemFormMixin, forms.ModelForm):
             self.add_error("default_shard", "Must be less than or equal to the shard modulo")
         # options
         options = {}
-        if self.cleaned_data.get("key") in ("managed_installs", "optional_installs"):
+        if self.cleaned_data.get("key") in ("default_installs", "managed_installs", "optional_installs"):
             excluded_tags = self.cleaned_data.get("excluded_tags")
             if excluded_tags:
                 options["excluded_tags"] = [tag.name for tag in excluded_tags]
@@ -177,140 +225,195 @@ class SubManifestPkgInfoForm(SubManifestItemFormMixin, forms.ModelForm):
         fields = ('pkg_info_name', 'key', 'condition', 'featured_item')
 
 
-class SubManifestAttachmentForm(SubManifestItemFormMixin, forms.ModelForm):
+class PackageForm(forms.ModelForm):
+    file = forms.FileField(required=True)
+    display_name = forms.CharField(required=False)
+    description = forms.CharField(widget=forms.Textarea(attrs={"rows": 2}), required=False)
+    excluded_tags = forms.ModelMultipleChoiceField(queryset=Tag.objects.all(), required=False)
+    shard_modulo = forms.IntegerField(min_value=1, max_value=1000, required=False, initial=100)
+    default_shard = forms.IntegerField(min_value=0, max_value=1000, required=False, initial=100)
+    field_order = [
+        "file",
+        "name",
+        "display_name", "description", "category",
+        "requires", "update_for",
+        "catalogs",
+        "excluded_tags",
+        "shard_modulo",
+        "default_shard",
+    ]
+
     def __init__(self, *args, **kwargs):
-        self.sub_manifest = kwargs.pop('sub_manifest')
+        self.pkg_info_name = kwargs.pop("pkg_info_name", None)
         super().__init__(*args, **kwargs)
+        data = self.instance.data
+        if data:
+            # re-hydrate some form fields with the pkg info data
+            display_name = data.get("display_name")
+            if display_name:
+                self.fields["display_name"].initial = display_name
+            description = data.get("description")
+            if description:
+                self.fields["description"].initial = description
+            # remove the file field
+            del self.fields["file"]
+            # remove the name field
+            del self.fields["name"]
+            # prepare the shards fields
+            self.fields["excluded_tags"].initial = [tag.pk for tag in self.instance.excluded_tags]
+            self.fields["default_shard"].initial = self.instance.default_shard
+            self.fields["shard_modulo"].initial = self.instance.shard_modulo
+        # catalogs
+        self.fields["catalogs"].queryset = Catalog.objects.for_upload()
+        # categories
+        self.fields["category"].queryset = PkgInfoCategory.objects.for_upload()
+        # hide name field if necessary
+        if self.pkg_info_name:
+            del self.fields["name"]
+        # tags
+        tag_qs = Tag.objects.select_related("meta_business_unit", "taxonomy").all()
+        self.fields['excluded_tags'].queryset = tag_qs
+        # tags shards
+        self.tag_shards = []
+        existing_tag_shard_dict = {}
+        if self.instance.pk:
+            existing_tag_shard_dict = {ts["tag"]: ts["shard"] for ts in self.instance.tag_shards}
+        for tag in tag_qs:
+            self.tag_shards.append(
+                (tag, tag in existing_tag_shard_dict, existing_tag_shard_dict.get(tag, self.instance.shard_modulo))
+            )
+        self.tag_shards.sort(key=lambda t: t[0].name.lower())
 
     class Meta:
-        model = SubManifestAttachment
-        fields = ('key', 'condition', 'featured_item', 'file',)
+        model = PkgInfo
+        fields = ("file",
+                  "name", "catalogs",
+                  "category",
+                  "requires", "update_for",
+                  "file")
 
     def clean_file(self):
-        f = self.cleaned_data["file"]
-        if not f:
-            raise forms.ValidationError("You need to select a file.")
-        error_messages = []
-        for file_class in (MobileconfigFile, PackageFile):
+        uploaded_file = self.cleaned_data["file"]
+        try:
+            self.cleaned_data["package_file"] = PackageFile(uploaded_file)
+        except AttachmentError as e:
+            raise forms.ValidationError(e.message)
+        return None
+
+    def clean_catalogs(self):
+        catalogs = self.cleaned_data.get("catalogs")
+        if catalogs and len(set(c.repository for c in catalogs)) > 1:
+            raise forms.ValidationError("The catalogs must be from the same repository.")
+        return catalogs
+
+    def clean(self):
+        self.instance.local = True
+        if self.instance.data is None:
+            self.instance.data = {}
+        data = self.instance.data
+        pin = self.cleaned_data.get("name", self.pkg_info_name)
+        # repository
+        catalogs = self.cleaned_data.get("catalogs")
+        if catalogs:
+            self.instance.repository = catalogs[0].repository
+            category = self.cleaned_data.get("category")
+            if category and category.repository != self.instance.repository:
+                self.add_error("category", "The category must be from the same repository as the catalogs.")
+        # file
+        pf = self.cleaned_data.get("package_file")
+        if pf:
+            data.update(pf.get_pkginfo_data())
+            version = data.get("version")
+            if version:
+                try:
+                    existing_pi = PkgInfo.objects.get(name=pin, version=version)
+                except PkgInfo.DoesNotExist:
+                    pass
+                else:
+                    if existing_pi.archived_at:
+                        # use the existing archived PkgInfo
+                        self.instance = existing_pi
+                        self.instance.local = True
+                        self.instance.archived_at = None
+                        self.instance.data = data
+                    else:
+                        self.add_error("file", "A PkgInfo with the same name and version already exists.")
+            self.instance.version = version
+            uf = pf.uploaded_file
+            if uf.name:
+                data["installer_item_location"] = uf.name
+        # name → data, instance
+        if pin:
+            self.instance.name = pin
+            data["name"] = pin.name
+        # zentral options → data
+        zentral_options = {}
+        default_shard = self.cleaned_data.get("default_shard")
+        shard_modulo = self.cleaned_data.get("shard_modulo")
+        if default_shard and shard_modulo and shard_modulo < default_shard:
+            self.add_error("default_shard", "Must be less than or equal to the shard modulo")
+        if default_shard is not None:
+            zentral_options.setdefault("shards", {})["default"] = default_shard
+        if shard_modulo is not None:
+            zentral_options.setdefault("shards", {})["modulo"] = shard_modulo
+        excluded_tags = self.cleaned_data.get("excluded_tags")
+        if excluded_tags:
+            zentral_options["excluded_tags"] = [tag.name for tag in excluded_tags]
+        tag_shards = {}
+        for tag, _, _ in self.tag_shards:
             try:
-                af = file_class(f)
-            except AttachmentError as e:
-                error_messages.append(e.message)
-            else:
-                break
+                shard = int(self.data[f"tag-shard-{tag.pk}"])
+            except Exception:
+                continue
+            if isinstance(shard_modulo, int):
+                shard = min(shard, shard_modulo)
+            tag_shards[tag.name] = shard
+        if tag_shards:
+            zentral_options.setdefault("shards", {})["tags"] = tag_shards
+        if zentral_options:
+            data["zentral_monolith"] = zentral_options
         else:
-            raise forms.ValidationError(", ".join(error_messages))
-        self.attachment_file = af
-        return f
+            data.pop("zentral_monolith", None)
+        # display name → data
+        display_name = self.cleaned_data["display_name"]
+        if display_name:
+            data["display_name"] = display_name
+        elif "display_name" in data:
+            del data["display_name"]
+        # description → data
+        description = self.cleaned_data["description"]
+        if description:
+            data["description"] = description
+        elif "description" in data:
+            del data["description"]
+        # category → data
+        category = self.cleaned_data.get("category")
+        if category:
+            data["category"] = category.name
+        elif "category" in data:
+            del data["category"]
+        # requires → data
+        requires = self.cleaned_data["requires"]
+        if requires:
+            data["requires"] = [pin.name for pin in requires]
+        elif "requires" in data:
+            del data["requires"]
+        # update for → data
+        update_for = self.cleaned_data["update_for"]
+        if update_for:
+            data["update_for"] = [pin.name for pin in update_for]
+        elif "update_for" in data:
+            del data["update_for"]
 
     def save(self, *args, **kwargs):
-        sma = super().save(commit=False)
-        sma.sub_manifest = self.sub_manifest
-        sma.type = self.attachment_file.type
-        sma.name = self.attachment_file.name
-        sma.identifier = self.attachment_file.identifier
-        for i in range(10):  # 10 trials max
-            max_version = SubManifestAttachment.objects.filter(
-                sub_manifest=self.sub_manifest,
-                name=sma.name
-            ).aggregate(Max("version"))["version__max"]
-            sma.version = (max_version or 0) + 1
-            sma.pkg_info = self.attachment_file.make_package_info(sma)
-            try:
-                with transaction.atomic():
-                    sma.save()
-            except IntegrityError:
-                raise
-            else:
-                break
-        else:
-            raise Exception("Could not find valid version #")
-        # trash other versions
-        for sma_with_different_version in (SubManifestAttachment.objects.filter(
-                                               sub_manifest=self.sub_manifest,
-                                               name=sma.name
-                                           ).exclude(version=sma.version)):
-            sma_with_different_version.mark_as_trashed()
-        return sma
-
-
-class SubManifestScriptForm(forms.Form):
-    DEFAULT_INSTALL_CHECK_SCRIPT = (
-        "#!/bin/bash\n\n"
-        "# WARNING: executed at every Munki run!\n\n"
-        "exit 0"
-    )
-    name = forms.CharField(max_length=256, required=True)
-    key = forms.ChoiceField(choices=(("managed_installs", "Managed Installs"),
-                                     ("managed_uninstalls", "Managed Uninstalls")),
-                            required=True)
-    description = forms.CharField(required=True, widget=forms.Textarea())
-    installcheck_script = forms.CharField(
-        label="install check script",
-        help_text="This script is executed to determine if an item needs to be installed. "
-                  "A return code of 0 means install is needed.",
-        required=True,
-        initial=DEFAULT_INSTALL_CHECK_SCRIPT,
-        widget=forms.Textarea(),
-    )
-    postinstall_script = forms.CharField(
-        label="post install script",
-        help_text="The main script.",
-        required=True,
-        widget=forms.Textarea(),
-    )
-    uninstall_script = forms.CharField(
-        label="uninstall script",
-        help_text="Script that performs an uninstall.",
-        required=False,
-        widget=forms.Textarea(),
-    )
-
-    def __init__(self, *args, **kwargs):
-        self.sub_manifest = kwargs.pop('sub_manifest')
-        self.script = kwargs.pop('script', None)
-        super().__init__(*args, **kwargs)
-
-    def save(self, *args, **kwargs):
-        name = self.cleaned_data["name"]
-        key = self.cleaned_data["key"]
-        pkg_info = {
-            'display_name': name,
-            'description': self.cleaned_data["description"],
-            'autoremove': False,
-            'unattended_install': True,
-            'installer_type': 'nopkg',
-            'uninstallable': True,
-            'unattended_uninstall': True,
-            'minimum_munki_version': '2.2',
-            'minimum_os_version': '10.6.0',  # TODO: HARDCODED !!!
-            'installcheck_script': self.cleaned_data["installcheck_script"],
-            'postinstall_script': self.cleaned_data["postinstall_script"],
-        }
-        uninstall_script = self.cleaned_data["uninstall_script"]
-        if uninstall_script:
-            pkg_info["uninstall_method"] = "uninstall_script"
-            pkg_info["uninstall_script"] = uninstall_script
-        if not self.script:
-            self.script = SubManifestAttachment(
-                sub_manifest=self.sub_manifest,
-                type="script",
-                key=key,
-                name=name,
-                pkg_info=pkg_info,
-                version=1,
-            )
-            self.script.save()
-        else:
-            self.script.name = name
-            self.script.key = key
-            self.script.version = F("version") + 1
-            self.script.pkg_info = pkg_info
-            self.script.save()
-            self.script.refresh_from_db()
-        self.script.pkg_info["version"] = "{}.0".format(self.script.version)
-        self.script.save()
-        return self.script
+        pi = super().save()
+        pf = self.cleaned_data.get("package_file")
+        if pf:
+            pi.file = pf.uploaded_file
+            pi.save()
+        for manifest in pi.name.manifests():
+            manifest.bump_version()
+        return pi
 
 
 class AddManifestCatalogForm(forms.Form):
@@ -320,11 +423,8 @@ class AddManifestCatalogForm(forms.Form):
     def __init__(self, *args, **kwargs):
         self.manifest = kwargs.pop('manifest')
         super().__init__(*args, **kwargs)
-        field = self.fields['catalog']
-        field.queryset = field.queryset.exclude(id__in=[mc.catalog_id
-                                                        for mc in self.manifest.manifestcatalog_set.all()])
-        field = self.fields['tags']
-        field.queryset = Tag.objects.available_for_meta_business_unit(self.manifest.meta_business_unit)
+        self.fields['catalog'].queryset = Catalog.objects.available_for_manifest(self.manifest, add_only=True)
+        self.fields['tags'].queryset = Tag.objects.available_for_meta_business_unit(self.manifest.meta_business_unit)
 
     def save(self):
         mc = ManifestCatalog(manifest=self.manifest,
@@ -374,22 +474,6 @@ class AddManifestEnrollmentPackageForm(forms.Form):
         super().__init__(*args, **kwargs)
         field = self.fields['tags']
         field.queryset = Tag.objects.available_for_meta_business_unit(self.manifest.meta_business_unit)
-
-
-class ManifestPrinterForm(forms.ModelForm):
-    def __init__(self, *args, **kwargs):
-        self.manifest = kwargs.pop('manifest')
-        super().__init__(*args, **kwargs)
-        field = self.fields['tags']
-        field.queryset = Tag.objects.available_for_meta_business_unit(self.manifest.meta_business_unit)
-
-    class Meta:
-        model = Printer
-        fields = ["tags",
-                  "name", "location",
-                  "scheme", "address",
-                  "shared", "error_policy", "ppd",
-                  "required_package"]
 
 
 class AddManifestSubManifestForm(forms.Form):
@@ -447,26 +531,6 @@ class DeleteManifestSubManifestForm(forms.Form):
                                                                sub_manifest=self.cleaned_data['sub_manifest']).delete()
         if number_deleted:
             self.manifest.save()  # updated_at
-
-
-class UploadPPDForm(forms.ModelForm):
-    class Meta:
-        model = PrinterPPD
-        fields = ['file']
-
-    def clean_file(self):
-        f = self.cleaned_data["file"]
-        try:
-            self.cleaned_data["ppd_info"] = get_ppd_information(f)
-        except Exception:
-            raise forms.ValidationError("Could not parse PPD file %s." % f.name)
-        return f
-
-    def save(self, *args, **kwargs):
-        ppd = PrinterPPD.objects.create(**self.cleaned_data["ppd_info"])
-        uploaded_file = self.cleaned_data["file"]
-        ppd.file.save(uploaded_file.name, uploaded_file)
-        return ppd
 
 
 class EnrollmentForm(forms.ModelForm):

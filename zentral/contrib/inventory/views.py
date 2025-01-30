@@ -9,23 +9,27 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.db.models import F
 from django.urls import reverse, reverse_lazy
-from django.http import Http404, HttpResponse, HttpResponseRedirect
+from django.http import Http404, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, redirect
-from django.template.loader import render_to_string
 from django.utils import timezone
-from django.views.generic import CreateView, DeleteView, DetailView, FormView, ListView, TemplateView, UpdateView, View
+from django.utils.functional import SimpleLazyObject
+from django.views.generic import DeleteView, DetailView, FormView, ListView, TemplateView, View
 from zentral.conf import settings
 from zentral.core.compliance_checks import compliance_check_class_from_model
 from zentral.core.compliance_checks.forms import ComplianceCheckForm
+from zentral.core.compliance_checks.models import Status
 from zentral.core.incidents.models import MachineIncident
 from zentral.core.stores.conf import frontend_store, stores
 from zentral.core.stores.views import EventsView, FetchEventsView, EventsStoreRedirectView
 from zentral.utils.text import encode_args
+from zentral.utils.terraform import build_config_response
+from zentral.utils.views import (CreateViewWithAudit, DeleteViewWithAudit, UpdateViewWithAudit,
+                                 UserPaginationListView, UserPaginationMixin)
 from .compliance_checks import InventoryJMESPathCheck
 from .events import JMESPathCheckCreated, JMESPathCheckUpdated, JMESPathCheckDeleted
 from .forms import (MetaBusinessUnitForm,
                     MetaBusinessUnitSearchForm, MachineGroupSearchForm,
-                    MergeMBUForm, MBUAPIEnrollmentForm, AddMBUTagForm, AddMachineTagForm,
+                    MergeMBUForm, AddMBUTagForm, AddMachineTagForm,
                     CreateTagForm, UpdateTagForm,
                     AndroidAppSearchForm, DebPackageSearchForm, IOSAppSearchForm,
                     MacOSAppSearchForm, ProgramsSearchForm,
@@ -35,6 +39,7 @@ from .models import (BusinessUnit,
                      MetaMachine,
                      MetaBusinessUnitTag, MachineTag, Tag, Taxonomy,
                      JMESPathCheck)
+from .terraform import iter_compliance_check_resources
 from .utils import (AndroidAppFilter, AndroidAppFilterForm,
                     BundleFilter, BundleFilterForm,
                     ComplianceCheckStatusFilter, ComplianceCheckStatusFilterForm,
@@ -49,28 +54,77 @@ from .utils import (AndroidAppFilter, AndroidAppFilterForm,
 logger = logging.getLogger("zentral.contrib.inventory.views")
 
 
-source_machine_subviews = {"_loaded": False}
+# Machine subviews contributed by the different apps.
+#
+# A machine subview is a piece of view that is displayed
+# in the tab info for a given source.
 
 
 def _load_source_machine_subviews():
+    result = {}
     for app in settings["apps"]:
         try:
             subview = getattr(import_module(f"{app}.views"), "InventoryMachineSubview")
         except (ModuleNotFoundError, AttributeError):
             pass
         else:
-            source_machine_subviews.setdefault(subview.source_key, []).append(subview)
-    source_machine_subviews["_loaded"] = True
+            result.setdefault(subview.source_key, []).append(subview)
+    return result
+
+
+source_machine_subviews = SimpleLazyObject(_load_source_machine_subviews)
 
 
 def _get_source_machine_subview(source, serial_number, user):
-    if not source_machine_subviews["_loaded"]:
-        _load_source_machine_subviews()
     source_key = (source.module, source.name)
     return [subview(serial_number, user) for subview in source_machine_subviews.get(source_key, [])]
 
 
-class MachineListView(PermissionRequiredMixin, TemplateView):
+# Machine actions contributed by the different apps.
+#
+# A machine action is a link to a page where an action can be
+# triggered for a give machine. The Zentral apps can offer actions
+# that are filtered and displayed in the `Action` dropdown menu.
+
+
+def _load_machine_actions():
+    result = {}
+    for app in settings["apps"]:
+        try:
+            actions = getattr(import_module(f"{app}.machine_actions"), "actions")
+        except (ModuleNotFoundError, AttributeError):
+            pass
+        else:
+            for action in actions:
+                result.setdefault(action.category or "", []).append(action)
+    return result
+
+
+machine_actions = SimpleLazyObject(_load_machine_actions)
+
+
+def _get_machine_actions(serial_number, user):
+    actions = []
+    for category in sorted(machine_actions.keys()):
+        category_actions = []
+        for action_class in machine_actions[category]:
+            action = action_class(serial_number, user)
+            if action.check_permissions():
+                category_actions.append((
+                    action.get_url(),
+                    action.get_disabled(),
+                    action.title,
+                    action.display_class,
+                ))
+        if category_actions:
+            actions.append((category, category_actions))
+    return actions
+
+
+# The views
+
+
+class MachineListView(PermissionRequiredMixin, UserPaginationMixin, TemplateView):
     template_name = "inventory/machine_list.html"
     last_seen_session_key = "inventory_last_last_seen"
     last_seen_default = "7d"
@@ -91,7 +145,7 @@ class MachineListView(PermissionRequiredMixin, TemplateView):
         request_dict = request.GET.copy()
         if "ls" not in request_dict:
             request_dict["ls"] = request.session.setdefault(self.last_seen_session_key, self.last_seen_default)
-        return MSQuery(request_dict)
+        return MSQuery(request_dict, paginate_by=self.get_paginate_by())
 
     def get(self, request, *args, **kwargs):
         try:
@@ -126,7 +180,6 @@ class MachineListView(PermissionRequiredMixin, TemplateView):
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        ctx['inventory'] = True
         # object
         ctx["object"] = self.object
         ctx['object_list_title'] = self.get_list_title()
@@ -244,7 +297,6 @@ class GroupsView(PermissionRequiredMixin, TemplateView):
 
     def get_context_data(self, **kwargs):
         context = super(GroupsView, self).get_context_data(**kwargs)
-        context['inventory'] = True
         qs = MachineGroup.objects.current()
         if self.search_form.is_valid():
             name = self.search_form.cleaned_data['name']
@@ -284,7 +336,7 @@ class GroupMachinesView(MachineListView):
                 (None, self.object.name)]
 
 
-class MBUView(PermissionRequiredMixin, ListView):
+class MBUView(PermissionRequiredMixin, UserPaginationListView):
     permission_required = "inventory.view_metabusinessunit"
     template_name = "inventory/mbu_list.html"
     paginate_by = 25
@@ -309,18 +361,9 @@ class MBUView(PermissionRequiredMixin, ListView):
 
     def get_context_data(self, **kwargs):
         context = super(MBUView, self).get_context_data(**kwargs)
-        context['inventory'] = True
-        context['search_form'] = self.search_form
+        context['form'] = self.search_form
         # pagination
         page = context['page_obj']
-        if page.has_next():
-            qd = self.request.GET.copy()
-            qd['page'] = page.next_page_number()
-            context['next_url'] = "?{}".format(qd.urlencode())
-        if page.has_previous():
-            qd = self.request.GET.copy()
-            qd['page'] = page.previous_page_number()
-            context['previous_url'] = "?{}".format(qd.urlencode())
         # breadcrumbs
         breadcrumbs = []
         qd = self.request.GET.copy()
@@ -342,7 +385,6 @@ class ReviewMBUMergeView(PermissionRequiredMixin, TemplateView):
 
     def get_context_data(self, **kwargs):
         ctx = super(ReviewMBUMergeView, self).get_context_data(**kwargs)
-        ctx['inventory'] = True
         ctx['meta_business_units'] = MetaBusinessUnit.objects.filter(id__in=self.request.GET.getlist('mbu_id'))
         return ctx
 
@@ -360,31 +402,24 @@ class MergeMBUView(PermissionRequiredMixin, FormView):
         return reverse('inventory:mbu_machines', args=(self.dest_mbu.id,))
 
 
-class CreateMBUView(PermissionRequiredMixin, CreateView):
+class CreateMBUView(PermissionRequiredMixin, CreateViewWithAudit):
     permission_required = "inventory.add_metabusinessunit"
     template_name = "inventory/edit_mbu.html"
     model = MetaBusinessUnit
     form_class = MetaBusinessUnitForm
 
 
-class UpdateMBUView(PermissionRequiredMixin, UpdateView):
+class UpdateMBUView(PermissionRequiredMixin, UpdateViewWithAudit):
     permission_required = "inventory.change_metabusinessunit"
     template_name = "inventory/edit_mbu.html"
     model = MetaBusinessUnit
     form_class = MetaBusinessUnitForm
 
 
-class DeleteMBUView(PermissionRequiredMixin, DeleteView):
+class DeleteMBUView(PermissionRequiredMixin, DeleteViewWithAudit):
     permission_required = "inventory.delete_metabusinessunit"
     model = MetaBusinessUnit
-
-    def delete(self, request, *args, **kwargs):
-        self.object = self.get_object()
-        try:
-            self.object.delete()
-        except ValueError:
-            logger.exception("Could not delete MBU %s", self.object.pk)
-        return HttpResponseRedirect(reverse('inventory:mbu'))
+    success_url = reverse_lazy("inventory:mbu")
 
 
 class MBUTagsView(PermissionRequiredMixin, FormView):
@@ -404,7 +439,6 @@ class MBUTagsView(PermissionRequiredMixin, FormView):
 
     def get_context_data(self, **kwargs):
         context = super(MBUTagsView, self).get_context_data(**kwargs)
-        context['inventory'] = True
         context['meta_business_unit'] = self.mbu
         context['tags'] = self.mbu.tags()
         context['color_presets'] = TAG_COLOR_PRESETS
@@ -444,7 +478,6 @@ class DetachBUView(PermissionRequiredMixin, TemplateView):
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
-        context['inventory'] = True
         context['bu'] = self.bu
         context['mbu'] = self.bu.meta_business_unit
         return context
@@ -452,20 +485,6 @@ class DetachBUView(PermissionRequiredMixin, TemplateView):
     def post(self, *args, **kwargs):
         mbu = self.bu.detach()
         return HttpResponseRedirect(mbu.get_absolute_url())
-
-
-class MBUAPIEnrollmentView(PermissionRequiredMixin, UpdateView):
-    permission_required = "inventory.change_metabusinessunit"
-    template_name = "inventory/mbu_api_enrollment.html"
-    form_class = MBUAPIEnrollmentForm
-    queryset = MetaBusinessUnit.objects.all()
-
-    def form_valid(self, form):
-        self.mbu = form.enable_api_enrollment()
-        return HttpResponseRedirect(self.get_success_url())
-
-    def get_success_url(self):
-        return reverse('inventory:mbu_machines', args=(self.mbu.id,))
 
 
 class MBUMachinesView(MachineListView):
@@ -537,7 +556,6 @@ class MachineView(PermissionRequiredMixin, TemplateView):
 
     def get_context_data(self, **kwargs):
         context = super(MachineView, self).get_context_data(**kwargs)
-        context['inventory'] = True
         context['machine'] = machine = MetaMachine.from_urlsafe_serial_number(context['urlsafe_serial_number'])
         context['serial_number'] = machine.serial_number
 
@@ -562,15 +580,13 @@ class MachineView(PermissionRequiredMixin, TemplateView):
                                                  key=ms_sort_key):
             source_subview = _get_source_machine_subview(source, machine.serial_number, self.request.user)
             context['machine_snapshots'].append((source_display, ms, source_subview))
-        machine_snapshots_count = len(context['machine_snapshots'])
-        if machine_snapshots_count:
-            context['max_source_tab_with'] = 100 // machine_snapshots_count
 
         # heartbeats?
         context['fetch_heartbeats'] = frontend_store.last_machine_heartbeats
 
         # compliance checks
         compliance_check_statuses = []
+        cc_total = cc_ok = cc_pending = cc_unknown = cc_failed = 0
         if self.request.user.has_perm("compliance_checks.view_machinestatus"):
             for cc_model, cc_pk, cc_name, status, status_time in machine.compliance_check_statuses():
                 cc_url = None
@@ -578,7 +594,21 @@ class MachineView(PermissionRequiredMixin, TemplateView):
                 if self.request.user.has_perms(cc_cls.required_view_permissions):
                     cc_url = reverse("compliance_checks:redirect", args=(cc_pk,))
                 compliance_check_statuses.append((cc_url, cc_name, status, status_time))
+                cc_total += 1
+                if status == Status.OK:
+                    cc_ok += 1
+                elif status == Status.PENDING:
+                    cc_pending += 1
+                elif status == Status.UNKNOWN:
+                    cc_unknown += 1
+                elif status == Status.FAILED:
+                    cc_failed += 1
         context["compliance_check_statuses"] = compliance_check_statuses
+        context["compliance_check_total"] = cc_total
+        context["compliance_check_ok"] = cc_ok
+        context["compliance_check_failed"] = cc_failed
+        context["compliance_check_pending"] = cc_pending
+        context["compliance_check_unknown"] = cc_unknown
 
         # event links
         context['show_events_link'] = frontend_store.machine_events
@@ -594,14 +624,7 @@ class MachineView(PermissionRequiredMixin, TemplateView):
         context["store_links"] = store_links
 
         # other actions
-        context["can_manage_tags"] = self.request.user.has_perms((
-            "inventory.view_machinetag",
-            "inventory.add_machinetag",
-            "inventory.change_machinetag",
-            "inventory.delete_machinetag",
-            "inventory.add_tag",
-        ))
-        context["can_archive_machine"] = self.request.user.has_perm("inventory.change_machinesnapshot")
+        context["actions"] = _get_machine_actions(machine.serial_number, self.request.user)
 
         return context
 
@@ -616,7 +639,6 @@ class ArchiveMachineView(PermissionRequiredMixin, TemplateView):
 
     def get_context_data(self, **kwargs):
         context = super(ArchiveMachineView, self).get_context_data(**kwargs)
-        context['inventory'] = True
         context['machine'] = self.machine
         return context
 
@@ -626,7 +648,7 @@ class ArchiveMachineView(PermissionRequiredMixin, TemplateView):
 
 
 class MachineEventsMixin:
-    permission_required = "inventory.view_machinesnapshot"
+    permission_required = ("inventory.view_machinesnapshot",)
     store_method_scope = "machine"
 
     def get_object(self, **kwargs):
@@ -830,7 +852,6 @@ class MachineIncidentsView(PermissionRequiredMixin, TemplateView):
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
-        context['inventory'] = True
         context['machine'] = machine = MetaMachine.from_urlsafe_serial_number(context['urlsafe_serial_number'])
         context['serial_number'] = machine.serial_number
         context['incidents'] = (MachineIncident.objects.select_related("incident")
@@ -856,7 +877,6 @@ class MachineTagsView(PermissionRequiredMixin, FormView):
 
     def get_context_data(self, **kwargs):
         context = super(MachineTagsView, self).get_context_data(**kwargs)
-        context['inventory'] = True
         context['machine'] = self.machine
         context['color_presets'] = TAG_COLOR_PRESETS
         return context
@@ -1056,12 +1076,11 @@ class DeleteComplianceCheckView(PermissionRequiredMixin, DeleteView):
         ctx["compliance_check"] = self.object.compliance_check
         return ctx
 
-    def delete(self, request, *args, **kwargs):
-        jmespath_check = self.get_object()
-        name = jmespath_check.compliance_check.name
-        event = JMESPathCheckDeleted.build_from_request_and_object(self.request, jmespath_check)
-        jmespath_check.compliance_check.delete()
-        messages.info(request, f'Compliance check "{name}" deleted')
+    def form_valid(self, form):
+        name = self.object.compliance_check.name
+        event = JMESPathCheckDeleted.build_from_request_and_object(self.request, self.object)
+        self.object.compliance_check.delete()
+        messages.info(self.request, f'Compliance check "{name}" deleted')
         transaction.on_commit(lambda: event.post())
         return redirect("inventory:compliance_checks")
 
@@ -1090,7 +1109,6 @@ class ComplianceCheckEventsMixin:
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        ctx["setup"] = True
         ctx["jmespath_check"] = self.object
         ctx["compliance_check"] = self.object.compliance_check
         return ctx
@@ -1149,23 +1167,7 @@ class ComplianceCheckTerraformExportView(PermissionRequiredMixin, View):
     permission_required = "inventory.view_jmespathcheck"
 
     def get(self, request, *args, **kwargs):
-        tags = set()
-        compliance_checks = []
-        for cc in (JMESPathCheck.objects.select_related("compliance_check")
-                                        .prefetch_related("tags").all().order_by("pk")):
-            tags.update(cc.tags.all())
-            compliance_checks.append(cc)
-        return HttpResponse(
-            render_to_string(
-                "inventory/compliancecheck_export.tf",
-                {"tags": sorted(tags, key=lambda t: t.pk),
-                 "compliance_checks": compliance_checks}
-            ).strip(),
-            headers={
-                "Content-Type": "text/plain",
-                "Content-Disposition": 'attachment; filename="jmespath_checks.tf"',
-            }
-        )
+        return build_config_response(iter_compliance_check_resources(), "terraform_jmespath_checks")
 
 
 # tags
@@ -1192,43 +1194,36 @@ class TagsView(PermissionRequiredMixin, TemplateView):
 
     def get_context_data(self, **kwargs):
         ctx = super(TagsView, self).get_context_data(**kwargs)
-        ctx['inventory'] = True
         ctx['tag_list'] = list(Tag.objects.all())
         ctx['taxonomy_list'] = list(Taxonomy.objects.all())
         return ctx
 
 
-class CreateTagView(PermissionRequiredMixin, CreateView):
+class CreateTagView(PermissionRequiredMixin, CreateViewWithAudit):
     permission_required = "inventory.add_tag"
     model = Tag
     form_class = CreateTagForm
+    success_url = reverse_lazy("inventory:tags")
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        ctx['inventory'] = True
         ctx['color_presets'] = TAG_COLOR_PRESETS
         return ctx
 
-    def get_success_url(self):
-        return reverse('inventory:tags')
 
-
-class UpdateTagView(PermissionRequiredMixin, UpdateView):
+class UpdateTagView(PermissionRequiredMixin, UpdateViewWithAudit):
     permission_required = "inventory.change_tag"
     model = Tag
     form_class = UpdateTagForm
+    success_url = reverse_lazy("inventory:tags")
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        ctx['inventory'] = True
         ctx['color_presets'] = TAG_COLOR_PRESETS
         return ctx
 
-    def get_success_url(self):
-        return reverse('inventory:tags')
 
-
-class DeleteTagView(PermissionRequiredMixin, DeleteView):
+class DeleteTagView(PermissionRequiredMixin, DeleteViewWithAudit):
     permission_required = "inventory.delete_tag"
     model = Tag
     success_url = reverse_lazy("inventory:tags")
@@ -1239,35 +1234,21 @@ class DeleteTagView(PermissionRequiredMixin, DeleteView):
         return ctx
 
 
-class CreateTaxonomyView(PermissionRequiredMixin, CreateView):
+class CreateTaxonomyView(PermissionRequiredMixin, CreateViewWithAudit):
     permission_required = "inventory.add_taxonomy"
     model = Taxonomy
     fields = ('meta_business_unit', 'name')
-
-    def get_context_data(self, **kwargs):
-        ctx = super().get_context_data(**kwargs)
-        ctx['inventory'] = True
-        return ctx
-
-    def get_success_url(self):
-        return reverse('inventory:tags')
+    success_url = reverse_lazy("inventory:tags")
 
 
-class UpdateTaxonomyView(PermissionRequiredMixin, UpdateView):
+class UpdateTaxonomyView(PermissionRequiredMixin, UpdateViewWithAudit):
     permission_required = "inventory.change_taxonomy"
     model = Taxonomy
     fields = ('name',)
-
-    def get_context_data(self, **kwargs):
-        ctx = super().get_context_data(**kwargs)
-        ctx['inventory'] = True
-        return ctx
-
-    def get_success_url(self):
-        return reverse('inventory:tags')
+    success_url = reverse_lazy("inventory:tags")
 
 
-class DeleteTaxonomyView(PermissionRequiredMixin, DeleteView):
+class DeleteTaxonomyView(PermissionRequiredMixin, DeleteViewWithAudit):
     permission_required = "inventory.delete_taxonomy"
     model = Taxonomy
     success_url = reverse_lazy("inventory:tags")
@@ -1281,7 +1262,7 @@ class DeleteTaxonomyView(PermissionRequiredMixin, DeleteView):
 # Apps
 
 
-class BaseAppsView(PermissionRequiredMixin, TemplateView):
+class BaseAppsView(PermissionRequiredMixin, UserPaginationMixin, TemplateView):
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
         if self.request.GET:
@@ -1305,7 +1286,7 @@ class BaseAppsView(PermissionRequiredMixin, TemplateView):
              ctx['total_objects'],
              previous_page,
              next_page,
-             ctx['total_pages']) = search_form.search(page=page, limit=50)
+             ctx['total_pages']) = search_form.search(page=page, limit=self.get_paginate_by())
             if next_page:
                 qd = self.request.GET.copy()
                 qd['page'] = next_page

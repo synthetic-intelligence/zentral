@@ -1,0 +1,114 @@
+{% extends 'base.html' %}
+{% load inventory_extras ui_extras %}
+
+
+{% block content %}
+<ol class="breadcrumb">
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'munki:index' %}">Munki</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'munki:script_checks' %}">Script checks</a></li>
+  <li class="breadcrumb-item active">{{ object }}</li>
+</ol>
+
+
+<div class="object-details">
+    <div class="d-flex align-items-center mb-1">
+        <h2 class="m-0">{{ object }}</h2>
+        <div class="ms-3">
+            {% if show_events_link %}
+                {% url 'munki:script_check_events' object.pk as url%}
+                {% button 'EVENTS' url %}
+            {% endif %}
+            {% for link, anchor_text in store_links  %}
+                {% button 'LINK' link anchor_text %}
+            {% endfor %}
+        </div>
+    </div>
+    <div class="d-flex align-items-center mb-3">
+        <h3 class="m-0 fs-5 text-secondary">Script check</h3>
+        <div class="ms-auto">
+            {% if perms.munki.change_scriptcheck %}
+                {% url 'munki:update_script_check' object.pk as url %}
+                {% button 'UPDATE' url "Edit Script Check" %}
+            {% endif %}
+            {% if perms.munki.delete_scriptcheck %}
+                {% url 'munki:delete_script_check' object.pk as url %}
+                {% button 'DELETE' url "Delete Script Check" %}
+            {% endif %}        
+        </div>
+    </div>
+
+    <div class="table-responsive mb-3">
+        <table class="table-object-properties table-fixed-scrolleable">
+        <thead>
+            <th style="width:15%">Attribute</th>
+            <th>Value</th>
+        </thead>
+        <tbody>
+            <tr>
+            <td>Name</td>
+            <td>{{ compliance_check.name }}</td>
+            </tr>
+            <tr>
+            <td>Description</td>
+            <td>{{ compliance_check.description|linebreaks }}</td>
+            </tr>
+            <tr>
+            <td>Type</td>
+            <td>{{ object.get_type_display }}</td>
+            </tr>
+            <tr>
+            <td>Source</td>
+                <td>
+                    <pre class="scrolleable">{{ object.source }}</pre>
+                </td>
+            </tr>
+            <tr>
+            <td>Expected result</td>
+            <td><code>{{ object.expected_result }}</code></td>
+            </tr>
+            <tr>
+            <td>Tags</td>
+            <td>
+                {% for tag in object.tags.all %}
+                {% inventory_tag tag %}
+                {% empty %}
+                -
+                {% endfor %}
+            </td>
+            </tr>
+            <tr>
+            <td>Excluded tags</td>
+            <td>
+                {% for tag in object.excluded_tags.all %}
+                {% inventory_tag tag %}
+                {% empty %}
+                -
+                {% endfor %}
+            </td>
+            </tr>
+            <tr>
+            <td>Intel?</td>
+            <td>{{ object.arch_amd64|yesno }}</td>
+            </tr>
+            <tr>
+            <td>Apple Silicon?</td>
+            <td>{{ object.arch_arm64|yesno }}</td>
+            </tr>
+            <tr>
+            <td>Min. OS version</td>
+            <td>{{ object.min_os_version|default:"-" }}</td>
+            </tr>
+            <tr>
+            <td>Max. OS version</td>
+            <td>{{ object.max_os_version|default:"-" }}</td>
+            </tr>
+        </tbody>
+        </table>
+    </div>
+
+    {% created_updated_at object %}
+
+</div>
+
+{% endblock %}

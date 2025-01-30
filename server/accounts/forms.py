@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 from django import forms
 from django.apps import apps
 from django.conf import settings as django_settings
-from django.contrib.auth.forms import AuthenticationForm, PasswordResetForm, UsernameField
+from django.contrib.auth.forms import AuthenticationForm, PasswordResetForm as DjangoPasswordResetForm,  UsernameField
 from django.contrib.auth.models import Group
 from django.core import signing, validators
 from django.db.models import Q
@@ -14,11 +14,13 @@ from django.utils.crypto import get_random_string
 from django.utils.translation import gettext_lazy as _
 import pyotp
 from webauthn import generate_authentication_options, options_to_json, verify_authentication_response
-from webauthn.helpers.structs import AuthenticationCredential, PublicKeyCredentialDescriptor
-from .models import User, UserTOTP, UserWebAuthn
+from webauthn.helpers import parse_authentication_credential_json
+from webauthn.helpers.structs import PublicKeyCredentialDescriptor
 from zentral.conf import settings as zentral_settings
 from zentral.conf.config import ConfigList
 from zentral.utils.base64 import trimmed_urlsafe_b64decode
+from .models import User, UserTOTP, UserWebAuthn
+from .password_reset import handler as password_reset_handler
 
 
 logger = logging.getLogger("zentral.accounts.forms")
@@ -96,11 +98,7 @@ class InviteUserForm(forms.ModelForm):
         user = super(InviteUserForm, self).save(commit=False)
         user.set_password(get_random_string(1024))
         user.save()
-        prf = PasswordResetForm({"email": user.email})
-        if prf.is_valid():
-            prf.save(request=request, use_https=True,
-                     email_template_name='registration/invitation_email.html',
-                     subject_template_name='registration/invitation_subject.txt')
+        password_reset_handler.send_password_reset(user, invitation=True)
         return user
 
 
@@ -147,7 +145,7 @@ class ServiceAccountForm(forms.ModelForm):
 class UpdateUserForm(forms.ModelForm):
     class Meta:
         model = User
-        fields = ("username", "email", "is_superuser", "groups")
+        fields = ("username", "email", "is_superuser", "groups", "items_per_page")
         field_classes = {'username': UsernameField}
 
     def __init__(self, *args, **kwargs):
@@ -161,10 +159,27 @@ class UpdateUserForm(forms.ModelForm):
             del self.fields["groups"]
 
 
+class UpdateProfileForm(forms.Form):
+    items_per_page = forms.IntegerField(
+        min_value=1, max_value=500,
+        help_text="Number of items per page in lists"
+    )
+
+    def __init__(self, *args, **kwargs):
+        self.user = kwargs.pop("user")
+        super().__init__(*args, **kwargs)
+        self.fields["items_per_page"].initial = self.user.items_per_page
+
+    def save(self, *args, **kwargs):
+        self.user.items_per_page = self.cleaned_data["items_per_page"]
+        self.user.save()
+        return self.user
+
+
 class AddTOTPForm(forms.Form):
     secret = forms.CharField(widget=forms.HiddenInput)
-    verification_code = forms.CharField(widget=forms.TextInput(attrs={"size": 6, "maxlength": 6}))
     name = forms.CharField(widget=forms.TextInput(attrs={'autofocus': ''}))
+    verification_code = forms.CharField(widget=forms.TextInput(attrs={"size": 6, "maxlength": 6}))
 
     def __init__(self, *args, **kwargs):
         self.user = kwargs.pop("user")
@@ -245,12 +260,16 @@ class VerifyTOTPForm(BaseVerifyForm):
 
     def clean(self):
         cleaned_data = super().clean()
-        verification_code = cleaned_data["verification_code"]
-        for verification_device in self.user.usertotp_set.all():
-            if verification_device.verify(verification_code):
-                break
+        try:
+            verification_code = cleaned_data["verification_code"]
+        except KeyError:
+            pass
         else:
-            self.add_error("verification_code", _("Invalid code"))
+            for verification_device in self.user.usertotp_set.all():
+                if verification_device.verify(verification_code):
+                    break
+            else:
+                self.add_error("verification_code", _("Invalid code"))
         return cleaned_data
 
 
@@ -284,7 +303,7 @@ class VerifyWebAuthnForm(BaseVerifyForm):
         cleaned_data = super().clean()
         webauthn_challenge = self.session["webauthn_challenge"]
         try:
-            credential = AuthenticationCredential.parse_raw(cleaned_data["token_response"])
+            credential = parse_authentication_credential_json(cleaned_data["token_response"])
         except Exception:
             msg = "Invalid token response"
             logger.exception(msg)
@@ -350,3 +369,10 @@ class RegisterWebAuthnDeviceForm(forms.Form):
         if name and UserWebAuthn.objects.filter(user=self.user, name=name).count():
             raise forms.ValidationError("A security key with this name is already registered with your account")
         return name
+
+
+class PasswordResetForm(DjangoPasswordResetForm):
+    def save(self, *args, **kwargs):
+        email = self.cleaned_data["email"]
+        for user in self.get_users(email):
+            password_reset_handler.send_password_reset(user, invitation=False)

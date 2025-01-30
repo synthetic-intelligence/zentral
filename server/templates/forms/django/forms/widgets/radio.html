@@ -1,0 +1,5 @@
+{% for group, options, index in widget.optgroups %}
+{% for option in options %}
+{% include "django/forms/widgets/radio_option.html" %}
+{% endfor %}
+{% endfor %}

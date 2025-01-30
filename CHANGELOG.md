@@ -1,14 +1,130 @@
-## 2022.3 (TBD)
+## 2024.1 (TBD)
 
 ### Features (some, not all…)
 
-New `zentral.core.stores.backends.snowflake` store backend.
+#### MDM
+
+Support for custom DDM declarations.
+
+Support for DDM software updates, with automatic enforcement of the latest OS versions.
+
+Support for enforced software update to the latest OS versions during ADE.
+
+Available software updates from the official Apple JSON feed and the Software Update Product ID.
+
+Filevault configuration during Setup Assistant with automatic PRK escrow, rotation and database encryption.
+
+Automatic recovery lock and firmware password management, with key rotation and database encryption.
+
+Automatic device tagging based on ADE authentication and IdP SCIM group memberships.
+
+VPP apps with automatic app device assignments.
+
+Support for more manual MDM commands and custom MDM commands.
+
+Variable substitution in MDM InstallApplication command config.
+
+Support for the MDM header signature authentication scheme.
+
+#### APIs / Terraform
+
+Much improved API coverage, many more [Terraform provider](https://registry.terraform.io/providers/zentralopensource/zentral/latest) resources.
+
+Better Terraform exports.
+
+#### Identity provider
+
+Add SCIM provisioning.
+
+Add Realm user support for up to two custom attributes.
+
+Add Realm group mapping claim separator.
+
+#### Munki
+
+Add Munki _Script Checks_. Those are Zentral compliance checks based on shell scripts, run by the Munki agent. They contribute to the reported health of the machines in the Zentral inventory, like the Inventory and Osquery based Zentral compliance checks.
+
+Support for multiple Munki repositories, and virtual repositories with direct package upload.
+
+Support for the Munki `default_installs` key.
+
+#### Santa
+
+Support for the [Santa Signing ID rules](https://santa.dev/concepts/rules.html#signing-id-rules).
+
+Support for the [Santa CDHASH rules](https://santa.dev/concepts/rules.html#cdhash-rules).
+
+Support for the `SyncExtraHeaders` configuration key and implementation of the authentication via `Zentral-Authorization` header.
+
+Exception portal.
+
+#### Inventory
+
+Jamf extensions attribute to principal user mapping.
+
+Microsoft Intune inventory sync.
+
+#### Events
+
+New Zentral Audit events to track configuration changes.
+
+New `zentral.core.stores.backends.snowflake` store backend for [Snowflake](https://www.snowflake.com/).
+
+New `zentral.core.stores.backends.panther` store backend for [Panther](https://panther.com/)
+
+#### One more thing…
+
+🚧 Alpha release of the new UI.
 
 ### Backward incompatibilities
+
+#### 🧨 Santa bundle rules removed
+
+Zentral doesn't support rules with a Bundle as target anymore. A migration will translated those rules into Binary rules.
+
+#### 🧨 Santa agent authentication
+
+The Santa agent is now authenticated with an extra `Zentral-Authorization` header that must contain the enrollment secret. The older endpoints are still active, but they are deprecated and will be removed in the near future.
+
+#### 🧨 dependency on Redis
+
+Redis is now required. It can be used as cache and background task backend, and replaces Memcached.
+
+#### 🧨 updated monolith configuration
+
+The Monolith repository is not configured in `base.json` anymore. Multiple Monolith repositories can be managed using the API or the GUI.
+
+#### 🧨 updated `/api/inventory/machines/tags/` API endpoint
+
+To add more flexibility, the payload for this API endpoint has changed. Please refer to [the documentation](https://docs.zentral.io/en/latest/apps/inventory/#apiinventorymachinestags).
+
+#### 🧨 new URLs for Monolith
+
+The Monolith URLs used by the Munki agent are now prefixed with `public/` by default. Configuration profiles (use the enrollment bump version button to force new ones) are including those new URLs, but agents currently deployed will keep using the legacy URLs until they are reconfigured. To mount the legacy endpoints required by those agents, set the optional configuration key `mount_legacy_public_endpoints` to `true` in the `zentral.contrib.monolith` app section of the `base.json` configuration in your deployments.
+
+#### 🧨 new URLs for Munki
+
+The Munki URLs used by the Munki agent are now prefixed with `public/` by default. Enrollment packages (use the enrollment bump version button to force new ones) are including those new URLs, but agents currently deployed will keep using the legacy URLs until they are reconfigured. To mount the legacy endpoints required by those agents, set the optional configuration key `mount_legacy_public_endpoints` to `true` in the `zentral.contrib.munki` app section of the `base.json` configuration in your deployments.
+
+#### 🧨 `nagios` and `simplemdm` legacy apps removed
+
+Please contact us if you are using one of those apps!
+
+#### 🧨 new URLs for the Realms authentication
+
+The Realms URLs used for authentication are now prefixed with `public/` by default. To mount the legacy endpoints required by existing SSO configurations, set the option key `mount_legacy_public_endpoints` to `true` in the `realms` app section of the `base.json` configuration in your deployments.
+
+#### 🧨 munki/monolith manifest names are unique now
+
+The monolith manifest names can be used as identifiers now. If you have multiple manifests with the same name in Zentral, the database migration cannot be applied. Please make sure the names are unique before upgrading.
 
 #### 🧨 new URLs for Osquery
 
 The Osquery URLs used by the Osquery agent are now prefixed with `public/` by default. Enrollment packages (use the enrollment bump version button to force new ones) are including those new URLs, but agents currently deployed will keep using the legacy URLs until they are reconfigured. To mount the legacy endpoints required by those agents, set the optional configuration key `mount_legacy_public_endpoints` to `true` in the `zentral.contrib.osquery` app section of the `base.json` configuration in your deployments.
+
+#### 🧨 new URLs for Santa
+
+As Osquery, the Santa URLs used by Santa agent are also affected with `public/` prefix by default for syncing and enrollment configuration. To mount the legacy endpoints required by those agents, set the optional configuration key `mount_legacy_public_endpoints` to `true` in the `zentral.contrib.santa` app section of the `base.json` configuration in your deployments.
 
 #### 🧨 Filebeat module removed
 

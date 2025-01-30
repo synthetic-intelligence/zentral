@@ -1,0 +1,79 @@
+{% load base_extras incidents_extras %}
+
+<ul class="nav z-3">
+    {% if user.is_authenticated %}
+    {% include "toggle_theme.html" with placement_class="dropdown-menu-lg-end"%}
+    {% if zentral_extra_links %}
+    <li class="nav-item dropdown">
+        <a class="nav-link btn btn-link" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false">
+            <i class="bi bi-display" data-bs-toggle="tooltip" data-bs-placement="bottom" data-bs-title="Extra links"></i>
+        </a>
+        <ul class="dropdown-menu dropdown-menu-end">
+            {% for link in zentral_extra_links %}
+                <li>
+                    <a class="dropdown-item" href="{{ link.url }}" target="_blank">
+                        {{ link.anchor_text }}
+                        <span class="bi bi-box-arrow-up-right"></span>
+                    </a>
+                </li>
+            {% endfor %}
+        </ul>
+    </li>
+    {% endif %}
+    {% if perms.incidents.view_incident %}
+        <li class="nav-item dropdown">
+            <a class="nav-link btn btn-link" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false">
+                <i class="bi bi-exclamation-triangle" data-bs-toggle="tooltip" data-bs-placement="bottom" data-bs-title="Major Open Incidents"></i>
+            </a>
+            <ul class="dropdown-menu dropdown-menu-end px-2" style="width: auto;">
+                {% get_latest_open_incidents as open_incidents %}
+                {% if open_incidents %}
+                    {% for incident in open_incidents %}
+                        <li class="text-nowrap"><a class="dropdown-item" href="{{ incident.get_absolute_url }}">{% incident_severity incident.severity %} {{ incident.name }}</a></li>
+                    {% endfor %}
+                {% else %}
+                    <li class="text-nowrap">No Open Incidents 🎉</li>
+                {% endif %}
+            </ul>
+        </li>
+    {% endif %}
+    <li class="nav-item dropdown">
+        <a class="nav-link btn btn-link" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false">
+            <i class="bi bi-three-dots-vertical" data-bs-toggle="tooltip" data-bs-placement="bottom" data-bs-title="Platform settings"></i>
+        </a>
+        <ul class="dropdown-menu dropdown-menu-end">
+            {% if perms.accounts.view_user %}
+            <li><a class="dropdown-item" href="{% url 'accounts:users' %}">Users</a></li>
+            {% endif %}
+            {% if perms.accounts.view_group %}
+            <li><a class="dropdown-item" href="{% url 'accounts:groups' %}">Roles</a></li>
+            {% endif %}
+            {% if perms.realms.view_realm %}
+            <li><a class="dropdown-item" href="{% url 'realms:list' %}">Realms</a></li>
+            {% endif %}
+            {% if perms.realms.view_realmgroup %}
+            <li><a class="dropdown-item" href="{% url 'realms:groups' %}">Groups</a></li>
+            {% endif %}
+            {% if perms.terraform.view_state %}
+            <li><a class="dropdown-item" href="{% url 'terraform:index' %}">Terraform</a></li>
+            {% endif %}
+        </ul>
+    </li>
+    <li class="nav-item dropdown">
+        <a class="nav-link btn btn-link" href="#" role="button" data-bs-toggle="dropdown" aria-expanded="false">
+            <i class="bi bi-person-circle" data-bs-toggle="tooltip" data-bs-placement="bottom" data-bs-title="User settings"></i>
+        </a>
+        <ul class="dropdown-menu dropdown-menu-end">
+            <li><a class="dropdown-item" href="{% url 'accounts:profile' %}">Profile</a></li>
+            {% if not request.realm_authentication_session.is_remote %}
+            <li><a class="dropdown-item" href="{% url 'password_change' %}">Change Password</a></li>
+            <li><a class="dropdown-item" href="{% url 'accounts:verification_devices' %}">Verification Devices</a></li>
+            {% else %}
+            <li style="padding:3px 20px"><span class="glyphicon glyphicon-cloud" aria-hidden="true"></span> {{ request.realm_authentication_session.realm }}</li>
+            <li role="separator" class="divider"></li>
+            {% endif %}
+            <li><form id="logout-form" action="{% url 'logout' %}">{% csrf_token %}<button type="submit" class="dropdown-item">Sign Out</button></form></li>
+        </ul>
+    </li>
+    {% endif %}
+</ul>

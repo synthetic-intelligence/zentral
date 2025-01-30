@@ -5,11 +5,10 @@ from django.contrib.auth import REDIRECT_FIELD_NAME, login as auth_login
 from django.core import signing
 from django.core.exceptions import PermissionDenied
 from django.http import HttpResponse, HttpResponseRedirect
-from django.shortcuts import resolve_url
+from django.shortcuts import redirect, resolve_url
 from django.template.response import TemplateResponse
 from django.urls import reverse
 from django.utils.http import url_has_allowed_host_and_scheme
-from django.views.decorators.cache import never_cache
 from django.views.decorators.csrf import csrf_protect
 from django.views.decorators.debug import sensitive_post_parameters
 from django.views.generic import FormView, View
@@ -25,13 +24,22 @@ logger = logging.getLogger("zentral.accounts.views.auth")
 
 @sensitive_post_parameters()
 @csrf_protect
-@never_cache
+# 'never_cache' with custom middleware
 def login(request):
     """
     Displays the login form and handles the login action.
     """
     redirect_to = request.POST.get(REDIRECT_FIELD_NAME,
                                    request.GET.get(REDIRECT_FIELD_NAME, ''))
+    # Ensure the user-originating redirection url is safe.
+    if not url_has_allowed_host_and_scheme(url=redirect_to,
+                                           allowed_hosts={request.get_host()},
+                                           require_https=request.is_secure()):
+        redirect_to = resolve_url(settings.LOGIN_REDIRECT_URL)
+
+    # Redirects if the user is already authenticated
+    if request.user.is_authenticated:
+        return HttpResponseRedirect(redirect_to)
 
     form = realm = None
 
@@ -39,13 +47,6 @@ def login(request):
         form = ZentralAuthenticationForm(request, data=request.POST)
         if form.is_valid():
             user = form.get_user()
-
-            # Ensure the user-originating redirection url is safe.
-            if not url_has_allowed_host_and_scheme(url=redirect_to,
-                                                   allowed_hosts={request.get_host()},
-                                                   require_https=request.is_secure()):
-                redirect_to = resolve_url(settings.LOGIN_REDIRECT_URL)
-
             if user.has_verification_device:
                 # Redirect to verification page
                 token = signing.dumps({"auth_backend": user.backend,
@@ -64,7 +65,6 @@ def login(request):
             else:
                 # Okay, security check complete. Log the user in.
                 auth_login(request, form.get_user())
-
                 return HttpResponseRedirect(redirect_to)
     else:
         try:
@@ -83,13 +83,20 @@ def login(request):
         login_realms = [realm]
     else:
         login_realms = Realm.objects.filter(enabled_for_login=True)
-    context["login_realms"] = [(r, reverse("realms:login", args=(r.pk,)))
+    context["login_realms"] = [(r, reverse("realms_public:login", args=(r.pk,)))
                                for r in login_realms]
 
     return TemplateResponse(request, "registration/login.html", context)
 
 
 class BaseVerify2FView(FormView):
+    def dispatch(self, request, *args, **kwargs):
+        if request.user.is_authenticated:
+            return redirect("accounts:profile")
+        if "verification_token" not in self.request.session:
+            return redirect("login")
+        return super().dispatch(request, *args, **kwargs)
+
     def get_form_kwargs(self):
         kwargs = super().get_form_kwargs()
         request = self.request

@@ -1,15 +1,23 @@
 {% extends 'base.html' %}
-{% load bootstrap %}
+{% load ui_extras %}
 
 {% block content %}
 <ol class="breadcrumb">
-  <li><a href="/">Home</a></li>
-  <li class="active">Osquery</li>
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item active">Osquery</li>
 </ol>
 
 <div class="row">
   <div class="col-md-12">
-    <h2>Osquery</h2>
+    <div class="d-flex justify-content-between mb-3">
+        <h2>Osquery</h2>
+        <div class="me-auto">
+            {% if show_terraform_export %}
+                {% url 'osquery:terraform_export' as url %}
+                {% button 'DOWNLOAD' url "Download Terraform config" %}
+            {% endif %}
+        </div>
+    </div>
   </div>
   <div class="col-sm-6">
     <canvas class="chart"
@@ -59,7 +67,12 @@
             type: 'bar',
             data: {labels: data.labels,
                    datasets: [data.datasets[dataset]]},
-            options: {}
+            options: {
+                scales: {
+                    x: {gridLines: { color: "darkgray", zeroLineColor: "darkgray" }},
+                    y: {gridLines: { color: "darkgray", zeroLineColor: "darkgray" }}
+                }
+            }
           });
         }
       }

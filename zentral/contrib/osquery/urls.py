@@ -1,5 +1,4 @@
 from django.urls import path
-from django.views.decorators.csrf import csrf_exempt
 from . import views
 
 app_name = "osquery"
@@ -41,6 +40,7 @@ urlpatterns = [
     path('packs/create/', views.CreatePackView.as_view(), name="create_pack"),
     path('packs/<int:pk>/', views.PackView.as_view(), name="pack"),
     path('packs/<int:pk>/update/', views.UpdatePackView.as_view(), name="update_pack"),
+    path('packs/<int:pk>/upload/', views.UploadPackView.as_view(), name="upload_pack"),
     path('packs/<int:pk>/delete/', views.DeletePackView.as_view(), name="delete_pack"),
     path('packs/<int:pk>/queries/add/', views.AddPackQueryView.as_view(), name="add_pack_query"),
     path('packs/<int:pk>/queries/<int:pq_pk>/update/', views.UpdatePackQueryView.as_view(), name="update_pack_query"),
@@ -86,10 +86,15 @@ urlpatterns = [
     path('configurations/<int:configuration_pk>/enrollments/<int:pk>/bump_version/',
          views.EnrollmentBumpVersionView.as_view(),
          name='bump_enrollment_version'),
+
+    # terraform
+    path('terraform_export/',
+         views.TerraformExportView.as_view(),
+         name='terraform_export'),
 ]
 
 
-setup_menu_cfg = {
+modules_menu_cfg = {
     'items': (
         ('index', 'Overview', False, ('osquery',)),
         ('packs', 'Packs', False, ('osquery.view_pack',)),
@@ -98,5 +103,6 @@ setup_menu_cfg = {
         ('configurations', 'Configurations', False, ('osquery.view_configuration',)),
         ('atcs', 'ATCs', False, ('osquery.view_automatictableconstruction',)),
         ('file_categories', 'File categories', False, ('osquery.view_filecategory',)),
-    )
+    ),
+    'weight': 40,
 }

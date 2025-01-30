@@ -1,11 +1,14 @@
+import copy
 from datetime import datetime
 import os.path
 import plistlib
 from django.test import TestCase
 from django.utils.crypto import get_random_string
+
 from zentral.contrib.inventory.models import MetaBusinessUnit, MetaMachine
+from zentral.contrib.mdm.artifacts import Target
 from zentral.contrib.mdm.commands import DeviceInformation, SecurityInfo
-from zentral.contrib.mdm.commands.scheduling import _update_inventory
+from zentral.contrib.mdm.commands.scheduling import _update_base_inventory
 from zentral.contrib.mdm.models import Blueprint, Channel, Platform, RequestStatus
 from .utils import force_dep_enrollment_session
 
@@ -37,20 +40,20 @@ class DeviceInformationCommandTestCase(TestCase):
 
     def test_scope(self):
         for channel, platform, user_enrollment, result in (
-            (Channel.Device, Platform.iOS, False, True),
-            (Channel.Device, Platform.iPadOS, False, True),
-            (Channel.Device, Platform.macOS, False, True),
-            (Channel.Device, Platform.tvOS, False, True),
-            (Channel.User, Platform.iOS, False, False),
-            (Channel.User, Platform.iPadOS, False, True),
-            (Channel.User, Platform.macOS, False, True),
-            (Channel.User, Platform.tvOS, False, False),
-            (Channel.Device, Platform.iOS, True, True),
-            (Channel.Device, Platform.iPadOS, True, False),
-            (Channel.Device, Platform.macOS, True, True),
-            (Channel.Device, Platform.tvOS, True, False),
+            (Channel.DEVICE, Platform.IOS, False, True),
+            (Channel.DEVICE, Platform.IPADOS, False, True),
+            (Channel.DEVICE, Platform.MACOS, False, True),
+            (Channel.DEVICE, Platform.TVOS, False, True),
+            (Channel.USER, Platform.IOS, False, False),
+            (Channel.USER, Platform.IPADOS, False, True),
+            (Channel.USER, Platform.MACOS, False, True),
+            (Channel.USER, Platform.TVOS, False, False),
+            (Channel.DEVICE, Platform.IOS, True, True),
+            (Channel.DEVICE, Platform.IPADOS, True, True),
+            (Channel.DEVICE, Platform.MACOS, True, True),
+            (Channel.DEVICE, Platform.TVOS, True, False),
         ):
-            self.enrolled_device.platform = platform.name
+            self.enrolled_device.platform = platform
             self.enrolled_device.user_enrollment = user_enrollment
             self.assertEqual(
                 result,
@@ -68,7 +71,7 @@ class DeviceInformationCommandTestCase(TestCase):
             if platforms is not None:
                 self.assertIsInstance(platforms, dict)
                 for platform, min_os_version in platforms.items():
-                    self.assertIn(platform, Platform.all_values())
+                    self.assertIn(platform, Platform.values)
                     self.assertIsInstance(min_os_version, tuple)
                     self.assertTrue(all(isinstance(i, int) for i in min_os_version))
 
@@ -85,9 +88,36 @@ class DeviceInformationCommandTestCase(TestCase):
 
     # process_response
 
+    def test_process_missing_query_responses(self):
+        response = copy.deepcopy(self.device_information)
+        response.pop("QueryResponses")
+        enrolled_device = self.dep_enrollment_session.enrolled_device
+        enrolled_device.os_version = "13.4.1"
+        enrolled_device.save()
+        cmd = DeviceInformation.create_for_device(
+            self.dep_enrollment_session.enrolled_device
+        )
+        cmd.process_response(response, self.dep_enrollment_session, self.mbu)
+        enrolled_device.refresh_from_db()
+        self.assertEqual(enrolled_device.os_version, "13.4.1")
+
+    def test_process_platform_change(self):
+        response = copy.deepcopy(self.device_information)
+        response["QueryResponses"]["ProductName"] = "iPhone14"
+        enrolled_device = self.dep_enrollment_session.enrolled_device
+        self.assertEqual(enrolled_device.platform, "macOS")
+        cmd = DeviceInformation.create_for_device(
+            self.dep_enrollment_session.enrolled_device
+        )
+        cmd.process_response(response, self.dep_enrollment_session, self.mbu)
+        enrolled_device.refresh_from_db()
+        self.assertEqual(enrolled_device.platform, "iOS")
+
     def test_process_acknowledged_response(self):
         start = datetime.utcnow()
         enrolled_device = self.dep_enrollment_session.enrolled_device
+        enrolled_device.os_version_extra = "(a)"
+        enrolled_device.build_version_extra = "YOLOa"
         self.assertIsNone(enrolled_device.device_information_updated_at)
         m0 = MetaMachine(self.dep_enrollment_session.enrolled_device.serial_number)
         self.assertEqual(len(m0.snapshots), 0)
@@ -108,38 +138,105 @@ class DeviceInformationCommandTestCase(TestCase):
         self.assertTrue(enrolled_device.device_information_updated_at > start)
         self.assertEqual(enrolled_device.platform, "macOS")
         self.assertEqual(enrolled_device.os_version, "13.0")
+        self.assertEqual(enrolled_device.os_version_extra, "")
+        self.assertEqual(enrolled_device.build_version, "22A5321d")
+        self.assertEqual(enrolled_device.build_version_extra, "")
+        self.assertEqual(enrolled_device.full_os_version, "13.0 (22A5321d)")
         self.assertTrue(enrolled_device.apple_silicon)
         self.assertTrue(enrolled_device.supervised)
+        self.assertEqual(enrolled_device.name, "Yolo")
+        self.assertEqual(enrolled_device.model, "VirtualMac2,1")
 
-    # _update_inventory
+    def test_process_acknowledged_response_missing_info(self):
+        start = datetime.utcnow()
+        enrolled_device = self.dep_enrollment_session.enrolled_device
+        self.assertIsNone(enrolled_device.device_information_updated_at)
+        m0 = MetaMachine(self.dep_enrollment_session.enrolled_device.serial_number)
+        self.assertEqual(len(m0.snapshots), 0)
+        cmd = DeviceInformation.create_for_device(
+            self.dep_enrollment_session.enrolled_device
+        )
+        device_information = copy.deepcopy(self.device_information)
+        for key in ("DeviceName", "ProductName", "Model", "SerialNumber", "OSVersion", "BuildVersion"):
+            device_information["QueryResponses"].pop(key)
+        cmd.process_response(device_information, self.dep_enrollment_session, self.mbu)
+        cmd.db_command.refresh_from_db()
+        self.assertIsNotNone(cmd.db_command.result)
+        self.assertIn("QueryResponses", cmd.response)
+        m = MetaMachine(enrolled_device.serial_number)
+        self.assertEqual(len(m.snapshots), 1)
+        ms = m.snapshots[0]
+        self.assertEqual(ms.source.module, "zentral.contrib.mdm")
+        enrolled_device.refresh_from_db()
+        self.assertEqual(enrolled_device.device_information["ActiveManagedUsers"],
+                         ["5DF1182E-C70B-4A3A-BADC-DD3E775040FB"])
+        self.assertTrue(enrolled_device.device_information_updated_at > start)
+        self.assertEqual(enrolled_device.platform, "macOS")
+        self.assertEqual(enrolled_device.os_version, "")
+        self.assertEqual(enrolled_device.os_version_extra, "")
+        self.assertEqual(enrolled_device.build_version, "")
+        self.assertEqual(enrolled_device.build_version_extra, "")
+        self.assertEqual(enrolled_device.full_os_version, "")
+        self.assertTrue(enrolled_device.apple_silicon)
+        self.assertTrue(enrolled_device.supervised)
+        self.assertIsNone(enrolled_device.name)
+        self.assertIsNone(enrolled_device.model)
 
-    def test_update_inventory_device_information_updated_at_none(self):
+    def test_process_acknowledged_response_supplemental_build_version_same_as_build_version(self):
+        response = copy.deepcopy(self.device_information)
+        response["QueryResponses"]["SupplementalBuildVersion"] = response["QueryResponses"]["BuildVersion"]
+        cmd = DeviceInformation.create_for_device(
+            self.dep_enrollment_session.enrolled_device
+        )
+        cmd.process_response(response, self.dep_enrollment_session, self.mbu)
+        enrolled_device = self.dep_enrollment_session.enrolled_device
+        self.assertEqual(enrolled_device.os_version, "13.0")
+        self.assertEqual(enrolled_device.os_version_extra, "")
+        self.assertEqual(enrolled_device.build_version, "22A5321d")
+        self.assertEqual(enrolled_device.build_version_extra, "")
+        self.assertEqual(enrolled_device.full_os_version, "13.0 (22A5321d)")
+
+    def test_process_acknowledged_response_rsr(self):
+        response = copy.deepcopy(self.device_information)
+        response["QueryResponses"]["SupplementalBuildVersion"] = "22E772610a"
+        response["QueryResponses"]["SupplementalOSVersionExtra"] = "(a)"
+        cmd = DeviceInformation.create_for_device(
+            self.dep_enrollment_session.enrolled_device
+        )
+        cmd.process_response(response, self.dep_enrollment_session, self.mbu)
+        enrolled_device = self.dep_enrollment_session.enrolled_device
+        self.assertEqual(enrolled_device.os_version, "13.0")
+        self.assertEqual(enrolled_device.os_version_extra, "(a)")
+        self.assertEqual(enrolled_device.build_version, "22A5321d")
+        self.assertEqual(enrolled_device.build_version_extra, "22E772610a")
+        self.assertEqual(enrolled_device.full_os_version, "13.0 (a) (22E772610a)")
+
+    # _update_base_inventory
+
+    def test_update_base_inventory_device_information_updated_at_none(self):
         self.assertIsNone(self.enrolled_device.device_information_updated_at)
-        cmd = _update_inventory(
-            Channel.Device, RequestStatus.Idle,
+        cmd = _update_base_inventory(
+            Target(self.enrolled_device),
             self.dep_enrollment_session,
-            self.enrolled_device,
-            None
+            RequestStatus.IDLE,
         )
         self.assertIsInstance(cmd, DeviceInformation)
 
-    def test_update_inventory_device_information_updated_at_old(self):
+    def test_update_base_inventory_device_information_updated_at_old(self):
         self.enrolled_device.device_information_updated_at = datetime(2000, 1, 1)
-        cmd = _update_inventory(
-            Channel.Device, RequestStatus.Idle,
+        cmd = _update_base_inventory(
+            Target(self.enrolled_device),
             self.dep_enrollment_session,
-            self.enrolled_device,
-            None
+            RequestStatus.IDLE,
         )
         self.assertIsInstance(cmd, DeviceInformation)
 
-    def test_update_inventory_device_information_updated_at_ok(self):
+    def test_update_base_inventory_device_information_updated_at_ok(self):
         self.enrolled_device.device_information_updated_at = datetime.utcnow()
         self.assertIsNone(self.enrolled_device.security_info_updated_at)
-        cmd = _update_inventory(
-            Channel.Device, RequestStatus.Idle,
+        cmd = _update_base_inventory(
+            Target(self.enrolled_device),
             self.dep_enrollment_session,
-            self.enrolled_device,
-            None,
+            RequestStatus.IDLE,
         )
         self.assertIsInstance(cmd, SecurityInfo)

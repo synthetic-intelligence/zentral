@@ -1,79 +1,85 @@
 {% extends 'base.html' %}
-{% load bootstrap inventory_extras %}
+{% load ui_extras inventory_extras %}
 
 {% block content %}
 <ol class="breadcrumb">
-  <li><a href="/">Home</a></li>
-  <li><a href="{%  url 'monolith:catalogs' %}">Monolith catalogs</a></li>
-  <li class="active">{{ object.name }}</li>
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'monolith:index' %}">Monolith</a></li>
+  <li class="breadcrumb-item"><a href="{%  url 'monolith:catalogs' %}">Catalogs</a></li>
+  <li class="breadcrumb-item active">{{ object }}</li>
 </ol>
 
-<h2>Catalog {{ object.name }}</h2>
+<div class="object-details">
+    <div class="d-flex align-items-center mb-1">
+        <h2>{{ object.name }}</h2>
+    </div>
+    <div class="d-flex align-items-center mb-3">
+        <h3 class="m-0 fs-5 text-secondary">Catalog</h3>
+        <div class="ms-auto">
+            {% if object.can_be_updated and perms.monolith.change_catalog %}
+                {% url 'monolith:update_catalog' object.pk as url %}
+                {% button 'UPDATE' url "Edit Monolith catalog" %}
+            {% endif %}
+            {% if object.can_be_deleted and perms.monolith.delete_catalog %}
+                {% url 'monolith:delete_catalog' object.pk as url %}
+                {% button 'DELETE' url "Delete Monolith catalog" %}
+            {% endif %}
+        </div>
+    </div>
 
-<p>
-    {% if not object.archived_at and perms.monolith.change_catalog %}
-    <a class="btn btn-default" href="{% url edit_catalog_view object.pk %}">
-      <span class="glyphicon glyphicon-edit" aria-hidden="true"></span>
-    </a>
-    {% endif %}
-    {% if object.can_be_deleted and perms.monolith.delete_catalog %}
-    <a class="btn btn-danger" href="{% url 'monolith:delete_catalog' object.pk %}">
-      <span class="glyphicon glyphicon-trash" aria-hidden="true"></span>
-    </a>
-    {% endif %}
-</p>
-
-<dl class="dl-horizontal">
-  <dt>Priority</dt>
-  <dd>{{ object.priority }}</dd>
-  <dt>Created at</dt>
-  <dd>{{ object.created_at }}</dd>
-  <dt>Archived at</dt>
-  <dd>{{ object.archived_at|default:"-" }}</dd>
-<dl>
-
-{% if perms.monolith.view_manifestcatalog %}
-<h3>{{ manifests|length }} manifest{{ manifests|length|pluralize }}</h3>
-
-{% if manifests %}
-<table class="table">
-  <thead>
-    <tr>
-      <th>Manifest</th>
-      <th>Tags</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for manifest, tags in manifests %}
-    <tr>
-      <td>
-        {% if perms.monolith.view_manifest %}
-        <a href="{% url 'monolith:manifest' manifest.id %}">{{ manifest }}</a>
-        {% else %}
-        {{ manifest }}
+    <table class="table-object-properties">
+      <tbody>
+        <tr>
+          <td>Name</td>
+          <td>{{ object.name }}</td>
+        </tr>
+        <tr>
+          <td>Repository</td>
+          <td>
+            {% if perms.monolith.view_repository %}
+            <a href="{{ object.repository.get_absolute_url }}">{{ object.repository }}</a> / {{ object.repository.get_backend_display }}
+            {% else %}
+            {{ object.repository }}
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td>Manifest{{ manifests|length|pluralize }} ({{ manifests|length }})</td>
+          <td>
+            {% if manifests %}
+            <ul class="list-unstyled">
+              {% for manifest, tags in manifests %}
+              <li>
+                {% if perms.monolith.view_manifest %}
+                <a href="{{ manifest.get_absolute_url }}">
+                  {{ manifest }}
+                </a>
+                {% else %}
+                {{ manifest }}
+                {% endif %}
+                {% for tag in tags %}
+                {% inventory_tag tag %}
+                {% endfor %}
+              </li>
+              {% endfor %}
+            </ul>
+            {% else %}
+            -
+            {% endif %}
+          </td>
+        </tr>
+        {% if pkg_infos %}
+        <tr>
+          <td>Package{{ pkg_infos|length|pluralize }} ({{ pkg_infos|length }})</td>
+          <td>
+            <a href="{{ object.get_pkg_info_url }}">Browse all packages</a>
+          </td>
+        </tr>
         {% endif %}
-      </td>
-      <td>
-        {% for tag in tags %}
-        {% inventory_tag tag %}
-        {% empty %}
-        -
-        {% endfor %}
-      </td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
-{% endif %}
-{% endif %}
+      </tbody>
+    </table>
 
-
-{% if perms.monolith.view_pkginfo %}
-<h3>{{ pkg_infos|length }} package{{ pkg_infos|length|pluralize }}</h3>
-
-{% if pkg_infos %}
-<p><a href="{{ object.get_pkg_info_url }}">Browse all packages</a>
-{% endif %}
-{% endif %}
+    {% created_updated_at object %}
+</div>
 
 {% endblock %}

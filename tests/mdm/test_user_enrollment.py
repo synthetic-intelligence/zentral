@@ -1,7 +1,7 @@
 from django.test import TestCase
 from django.utils.crypto import get_random_string
 from zentral.contrib.inventory.models import MetaBusinessUnit
-from zentral.contrib.mdm.models import ReEnrollmentSession, UserEnrollmentSession
+from zentral.contrib.mdm.models import ReEnrollmentSession, UserEnrollment, UserEnrollmentSession
 from zentral.contrib.mdm.payloads import build_scep_payload
 from .utils import complete_enrollment_session, force_realm_user, force_user_enrollment
 
@@ -13,11 +13,33 @@ class TestUserEnrollment(TestCase):
         cls.mbu.create_enrollment_business_unit()
         cls.realm, cls.realm_user = force_realm_user()
 
+    def test_user_enrollment_cannot_be_deleted(self):
+        enrollment = force_user_enrollment(self.mbu, self.realm)
+        UserEnrollmentSession.objects.create_from_user_enrollment(enrollment)
+        self.assertFalse(enrollment.can_be_deleted())
+
+    def test_user_enrollment_delete_value_error(self):
+        enrollment = force_user_enrollment(self.mbu, self.realm)
+        UserEnrollmentSession.objects.create_from_user_enrollment(enrollment)
+        with self.assertRaises(ValueError) as cm:
+            enrollment.delete()
+        self.assertEqual(cm.exception.args[0], f"UserEnrollment {enrollment.pk} cannot be deleted")
+
+    def test_user_enrollment_delete_ok(self):
+        enrollment = force_user_enrollment(self.mbu, self.realm)
+        enrollment_pk = enrollment.pk
+        enrollment.delete()
+        self.assertFalse(UserEnrollment.objects.filter(pk=enrollment_pk).exists())
+
     def test_create_user_enrollment_session_no_managed_apple_id(self):
         enrollment = force_user_enrollment(self.mbu, self.realm)
         session = UserEnrollmentSession.objects.create_from_user_enrollment(enrollment)
         self.assertEqual(session.get_enrollment(), enrollment)
         self.assertEqual(session.status, "ACCOUNT_DRIVEN_START")
+        self.assertEqual(
+            session.serialize_for_event(),
+            {"enrollment_session": {"pk": session.pk, "type": "user", "status": "ACCOUNT_DRIVEN_START"}}
+        )
 
     def test_user_enrollment_session_scep_payload(self):
         enrollment = force_user_enrollment(self.mbu, self.realm)
@@ -47,6 +69,8 @@ class TestUserEnrollment(TestCase):
         self.assertIsNone(reenrollment_session.ota_enrollment)
         self.assertEqual(reenrollment_session.user_enrollment, enrollment)
         self.assertEqual(reenrollment_session.status, ReEnrollmentSession.STARTED)
+        self.assertEqual(reenrollment_session.first_enrolled_at, session.created_at)
+        self.assertEqual(reenrollment_session.device_enrolled_at, session.device_enrolled_at)
         re_s, user_s = list(session.enrolled_device.iter_enrollment_session_info())
         self.assertEqual(re_s["session_type"], "RE")
         self.assertEqual(re_s["id"], reenrollment_session.pk)

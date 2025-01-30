@@ -115,6 +115,10 @@ class ProductArchiveBuilder(BasePackageBuilder):
             self.pkg_refs.append({"id": pkg_ref.get("id"),
                                   "version": pkg_ref.get("version")})
 
+    def get_host_architectures(self):
+        # default to universal packages
+        return ["x86_64", "arm64"]
+
     def _build_empty_distribution(self):
         root = ET.Element("installer-gui-script")
         root.set("minSpecVersion", "1")
@@ -122,11 +126,16 @@ class ProductArchiveBuilder(BasePackageBuilder):
         title.text = self.title
         root.append(title)
         options = ET.Element("options")
-        options.set("customize", "allow")
-        options.set("allow-external-scripts", "no")
+        options.set("allow-external-scripts", "false")
+        options.set("customize", "never")
+        options.set("hostArchitectures", ",".join(self.get_host_architectures()))
+        options.set("require-scripts", "false")
+        options.set("rootVolumeOnly", "true")
         root.append(options)
-        domains = ET.Element("domains")
-        domains.set("enable_anywhere", "true")
+        domains = ET.Element("domains")  # local root only
+        domains.set("enable_anywhere", "false")
+        domains.set("enable_currentUserHome", "false")
+        domains.set("enable_localSystem", "true")
         root.append(domains)
         choices_outline = ET.Element("choices-outline")
         root.append(choices_outline)
@@ -315,9 +324,6 @@ class PackageBuilder(BasePackageBuilder, APIConfigToolsMixin):
     def extra_build_steps(self):
         pass
 
-    def extra_product_archive_build_steps(self, product_archive_builder):
-        pass
-
     def get_product_archive(self):
         return None
 
@@ -341,17 +347,16 @@ class PackageBuilder(BasePackageBuilder, APIConfigToolsMixin):
         self._build_scripts()
         self._build_bom()
 
+        product_archive_title = self.get_product_archive_title()
         product_archive = self.get_product_archive()
         extra_packages = self.get_extra_packages()
 
-        if product_archive or extra_packages:
+        if product_archive_title or product_archive or extra_packages:
             # build a product archive
-            builder = ProductArchiveBuilder(self.get_product_archive_title(),
-                                            product_archive)
+            builder = ProductArchiveBuilder(product_archive_title, product_archive)
             for extra_package in extra_packages:
                 builder.add_package(extra_package)
             builder.add_package(self.package_dir)
-            self.extra_product_archive_build_steps(builder)
             self._clean()
         else:
             # build a component package
@@ -445,9 +450,6 @@ class PackageBuilder(BasePackageBuilder, APIConfigToolsMixin):
             with open(self.get_root_path(tls_server_certs_rel_path), "w") as f:
                 f.write(tls_fullchain)
             return TLS_SERVER_CERTS_CLIENT_PATH
-
-    def is_product_archive(self):
-        return self.get_product_archive() is not None or len(self.get_extra_packages()) > 0
 
     def create_file_with_content_string(self, rel_path, content, executable=False):
         filepath = self.get_root_path(rel_path)

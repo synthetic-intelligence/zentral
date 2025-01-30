@@ -1,52 +1,55 @@
 from django.shortcuts import get_object_or_404
+from django_filters import rest_framework as filters
 from rest_framework import generics
+from rest_framework.authentication import SessionAuthentication
 from rest_framework.views import APIView
-from zentral.utils.drf import DefaultDjangoModelPermissions, DjangoPermissionRequired
-from .models import Configuration, Enrollment
+from accounts.api_authentication import APITokenAuthentication
+from zentral.utils.drf import (DefaultDjangoModelPermissions, DjangoPermissionRequired,
+                               ListCreateAPIViewWithAudit, RetrieveUpdateDestroyAPIViewWithAudit)
+from .models import Configuration, Enrollment, ScriptCheck
 from .osx_package.builder import MunkiZentralEnrollPkgBuilder
-from .serializers import ConfigurationSerializer, EnrollmentSerializer
+from .serializers import ConfigurationSerializer, EnrollmentSerializer, ScriptCheckSerializer
 
 
-class ConfigurationList(generics.ListAPIView):
-    """
-    List all Configurations
-    """
+# configurations
+
+
+class ConfigurationList(ListCreateAPIViewWithAudit):
     queryset = Configuration.objects.all()
-    permission_classes = [DefaultDjangoModelPermissions]
     serializer_class = ConfigurationSerializer
+    permission_classes = [DefaultDjangoModelPermissions]
+    filter_backends = (filters.DjangoFilterBackend,)
+    filterset_fields = ("name",)
 
 
-class ConfigurationDetail(generics.RetrieveAPIView):
-    """
-    Retrieve a Configuration instance.
-    """
+class ConfigurationDetail(RetrieveUpdateDestroyAPIViewWithAudit):
     queryset = Configuration.objects.all()
-    permission_classes = [DefaultDjangoModelPermissions]
     serializer_class = ConfigurationSerializer
+    permission_classes = [DefaultDjangoModelPermissions]
 
 
-class EnrollmentList(generics.ListAPIView):
-    """
-    List all Enrollments
-    """
+# enrollments
+
+
+class EnrollmentList(generics.ListCreateAPIView):
+    queryset = Enrollment.objects.all()
+    permission_classes = [DefaultDjangoModelPermissions]
+    serializer_class = EnrollmentSerializer
+    filter_backends = (filters.DjangoFilterBackend,)
+    filterset_fields = ("configuration_id",)
+
+
+class EnrollmentDetail(generics.RetrieveUpdateDestroyAPIView):
     queryset = Enrollment.objects.all()
     permission_classes = [DefaultDjangoModelPermissions]
     serializer_class = EnrollmentSerializer
 
 
-class EnrollmentDetail(generics.RetrieveAPIView):
-    """
-    Retrieve an Enrollment instance.
-    """
-    queryset = Enrollment.objects.all()
-    permission_classes = [DefaultDjangoModelPermissions]
-    serializer_class = EnrollmentSerializer
+# enrollment packages
 
 
 class EnrollmentPackage(APIView):
-    """
-    Download enrollment package
-    """
+    authentication_classes = [APITokenAuthentication, SessionAuthentication]
     permission_required = "munki.view_enrollment"
     permission_classes = [DjangoPermissionRequired]
 
@@ -54,3 +57,21 @@ class EnrollmentPackage(APIView):
         enrollment = get_object_or_404(Enrollment, pk=self.kwargs["pk"])
         builder = MunkiZentralEnrollPkgBuilder(enrollment)
         return builder.get_conditional_response(self.request)
+
+
+# script checks
+
+
+class ScriptCheckFilter(filters.FilterSet):
+    name = filters.CharFilter(field_name="compliance_check__name")
+
+
+class ScriptCheckList(ListCreateAPIViewWithAudit):
+    queryset = ScriptCheck.objects.select_related("compliance_check").all()
+    serializer_class = ScriptCheckSerializer
+    filterset_class = ScriptCheckFilter
+
+
+class ScriptCheckDetail(RetrieveUpdateDestroyAPIViewWithAudit):
+    queryset = ScriptCheck.objects.select_related("compliance_check").all()
+    serializer_class = ScriptCheckSerializer

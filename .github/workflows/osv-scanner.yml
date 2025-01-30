@@ -1,0 +1,38 @@
+# A sample workflow which sets up periodic OSV-Scanner scanning for vulnerabilities,
+# in addition to a PR check which fails if new vulnerabilities are introduced.
+#
+# For more examples and options, including how to ignore specific vulnerabilities,
+# see https://google.github.io/osv-scanner/github-action/
+
+name: OSV-Scanner
+
+on:
+  pull_request:
+    branches: [ "main" ]
+  merge_group:
+    branches: [ "main" ]
+  schedule:
+    - cron: '28 22 * * 1'
+  push:
+    branches: [ "main" ]
+
+permissions:
+  actions: read
+  contents: read # to fetch code (actions/checkout)
+  security-events: write # for uploading SARIF files
+
+jobs:
+  scan-scheduled:
+    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
+    uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@678a866dcba398c8ed0124a09928d250f187b52a" # v1.8.4
+    with:
+      scan-args: |-
+        --lockfile ./package-lock.json
+        --lockfile requirements.txt:./constraints.txt
+  scan-pr:
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+    uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@678a866dcba398c8ed0124a09928d250f187b52a" # v1.8.4
+    with:
+      scan-args: |-
+        --lockfile ./package-lock.json
+        --lockfile requirements.txt:./constraints.txt

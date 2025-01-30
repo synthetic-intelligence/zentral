@@ -1,20 +1,20 @@
 {% extends 'base.html' %}
-{% load inventory_extras %}
+{% load base_extras inventory_extras %}
 
 {% block content %}
 <div class="row">
   <div class="col-md-12">
     <ol class="breadcrumb">
-      <li><a href="/">Home</a></li>
-      <li><a href="{% url 'inventory:index' %}">Inventory machines</a></li>
-      <li><a href="{{ machine.get_absolute_url }}">{{ machine.serial_number }}</a></li>
-      <li class="active">archive</li>
+      <li class="breadcrumb-item"><a href="/">Home</a></li>
+      <li class="breadcrumb-item"><a href="{% url 'inventory:index' %}">Inventory machines</a></li>
+      <li class="breadcrumb-item"><a href="{{ machine.get_absolute_url }}">{{ machine.serial_number|privacywrapper }}</a></li>
+      <li class="breadcrumb-item active">archive</li>
     </ol>
 
     <h2>
       {% machine_type_icon machine %}
       {% machine_platform_icon machine %}
-      {% if machine.computer_name %}{{ machine.computer_name }} / {% endif %}{{ machine.serial_number }}
+      {% if machine.computer_name %}{{ machine.computer_name }} / {% endif %}{{ machine.serial_number|privacywrapper }}
     </h2>
 
     <p>
@@ -25,7 +25,7 @@
 
     <p>Do you really want to archive this machine?</p>
     <form method="POST">{% csrf_token %}
-      <a class="btn btn-default" href="{{ machine.get_absolute_url }}">No</a>
+      <a class="btn btn-outline-secondary" href="{{ machine.get_absolute_url }}">No</a>
       <button type="submit" class="btn btn-danger">Yes</button>
     </form>
 

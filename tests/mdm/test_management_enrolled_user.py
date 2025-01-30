@@ -9,8 +9,10 @@ from django.urls import reverse
 from django.utils.crypto import get_random_string
 from accounts.models import User
 from zentral.contrib.inventory.models import MetaBusinessUnit
+from zentral.contrib.mdm.artifacts import Target
 from zentral.contrib.mdm.commands import CustomCommand
-from .utils import force_dep_enrollment_session, force_enrolled_user
+from zentral.contrib.mdm.models import Channel, TargetArtifact, UserArtifact
+from .utils import force_artifact, force_dep_enrollment_session, force_enrolled_user
 
 
 @override_settings(STATICFILES_STORAGE='django.contrib.staticfiles.storage.StaticFilesStorage')
@@ -69,14 +71,14 @@ class EnrolledUserManagementViewsTestCase(TestCase):
         self.assertContains(response, enrolled_user.short_name)
         self.assertContains(response, enrolled_user.long_name)
         self.assertContains(response, enrolled_device.udid)
-        self.assertContains(response, "0 Artifacts")
-        self.assertContains(response, "Last commands")
+        self.assertContains(response, "Artifacts (0)")
+        self.assertNotContains(response, "Last commands")
         self.assertNotContains(response, "See all commands")
 
     def test_enrolled_user_one_command(self):
         enrolled_user, enrolled_device = self._force_enrolled_user()
-        CustomCommand.create_for_user(
-            enrolled_user,
+        CustomCommand.create_for_target(
+            Target(enrolled_device, enrolled_user),
             kwargs={"command": plistlib.dumps({"RequestType": "ProfileList"}).decode("utf-8")},
             queue=True
         )
@@ -93,8 +95,8 @@ class EnrolledUserManagementViewsTestCase(TestCase):
         enrolled_user, enrolled_device = self._force_enrolled_user()
         first_command = second_command = None
         for i in range(11):
-            cmd = CustomCommand.create_for_user(
-                enrolled_user,
+            cmd = CustomCommand.create_for_target(
+                Target(enrolled_device, enrolled_user),
                 kwargs={"command": plistlib.dumps({"RequestType": "ProfileList"}).decode("utf-8")},
                 queue=True
             )
@@ -120,12 +122,53 @@ class EnrolledUserManagementViewsTestCase(TestCase):
         self.assertContains(response, "See all commands")
         self.assertContains(
             response,
-            reverse("mdm:download_enrolled_user_command_result", args=(first_command.db_command.uuid,))
+            reverse("mdm:download_enrolled_device_command_result", args=(first_command.db_command.uuid,))
         )
         self.assertNotContains(
             response,
-            reverse("mdm:download_enrolled_user_command_result", args=(second_command.db_command.uuid,))
+            reverse("mdm:download_enrolled_device_command_result", args=(second_command.db_command.uuid,))
         )
+
+    # test enrolled user target artifacts
+
+    def test_enrolled_user_target_artifact_installed(self):
+        enrolled_user, enrolled_device = self._force_enrolled_user()
+        artifact, (profile_av,) = force_artifact(channel=Channel.USER)
+        ua = UserArtifact.objects.create(
+            enrolled_user=enrolled_user,
+            artifact_version=profile_av,
+            status=TargetArtifact.Status.INSTALLED,
+            extra_info={"valid": "valid", "active": True}
+        )
+        self._login("mdm.view_enrolleduser")
+        response = self.client.get(reverse("mdm:enrolled_user", args=(enrolled_device.pk, enrolled_user.pk)))
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "mdm/enrolleduser_detail.html")
+        self.assertContains(response, artifact.name)
+        self.assertNotContains(response, f"mi-{ua.pk}")
+
+    def test_enrolled_user_target_artifact_failed(self):
+        enrolled_user, enrolled_device = self._force_enrolled_user()
+        artifact, (profile_av,) = force_artifact(channel=Channel.USER)
+        error = get_random_string(12)
+        ua = UserArtifact.objects.create(
+            enrolled_user=enrolled_user,
+            artifact_version=profile_av,
+            status=TargetArtifact.Status.INSTALLED,
+            extra_info={"valid": "valid", "active": True,
+                        "reasons": [{"details": {"Error": error},
+                                     "description": "Configuration cannot be applied",
+                                     "code": "Error.ConfigurationCannotBeApplied"}]}
+        )
+        self._login("mdm.view_enrolleduser")
+        response = self.client.get(reverse("mdm:enrolled_user", args=(enrolled_device.pk, enrolled_user.pk)))
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "mdm/enrolleduser_detail.html")
+        self.assertContains(response, artifact.name)
+        self.assertContains(response, f"mi-{ua.pk}")
+        self.assertContains(response, error)
+        self.assertContains(response, "Configuration cannot be applied")
+        self.assertContains(response, "Error.ConfigurationCannotBeApplied")
 
     # test enrolled user commands
 
@@ -145,8 +188,8 @@ class EnrolledUserManagementViewsTestCase(TestCase):
         enrolled_user, enrolled_device = self._force_enrolled_user()
         first_command = second_command = None
         for i in range(5):
-            cmd = CustomCommand.create_for_user(
-                enrolled_user,
+            cmd = CustomCommand.create_for_target(
+                Target(enrolled_device, enrolled_user),
                 kwargs={"command": plistlib.dumps({"RequestType": "ProfileList"}).decode("utf-8")},
                 queue=True
             )
@@ -184,8 +227,8 @@ class EnrolledUserManagementViewsTestCase(TestCase):
 
     def test_download_enrolled_user_command_result_redirect(self):
         enrolled_user, enrolled_device = self._force_enrolled_user()
-        cmd = CustomCommand.create_for_user(
-            enrolled_user,
+        cmd = CustomCommand.create_for_target(
+            Target(enrolled_device, enrolled_user),
             kwargs={"command": plistlib.dumps({"RequestType": "DeviceInformation"}).decode("utf-8")},
             queue=True
         )
@@ -193,8 +236,8 @@ class EnrolledUserManagementViewsTestCase(TestCase):
 
     def test_download_enrolled_user_command_result_permission_denied(self):
         enrolled_user, enrolled_device = self._force_enrolled_user()
-        cmd = CustomCommand.create_for_user(
-            enrolled_user,
+        cmd = CustomCommand.create_for_target(
+            Target(enrolled_device, enrolled_user),
             kwargs={"command": plistlib.dumps({"RequestType": "DeviceInformation"}).decode("utf-8")},
             queue=True
         )
@@ -204,8 +247,8 @@ class EnrolledUserManagementViewsTestCase(TestCase):
 
     def test_download_enrolled_user_command_result_no_result_404(self):
         enrolled_user, enrolled_device = self._force_enrolled_user()
-        cmd = CustomCommand.create_for_user(
-            enrolled_user,
+        cmd = CustomCommand.create_for_target(
+            Target(enrolled_device, enrolled_user),
             kwargs={"command": plistlib.dumps({"RequestType": "DeviceInformation"}).decode("utf-8")},
             queue=True
         )
@@ -215,8 +258,8 @@ class EnrolledUserManagementViewsTestCase(TestCase):
 
     def test_download_enrolled_user_command_result(self):
         enrolled_user, enrolled_device = self._force_enrolled_user()
-        cmd = CustomCommand.create_for_user(
-            enrolled_user,
+        cmd = CustomCommand.create_for_target(
+            Target(enrolled_device, enrolled_user),
             kwargs={"command": plistlib.dumps({"RequestType": "DeviceInformation"}).decode("utf-8")},
             queue=True
         )

@@ -2,7 +2,6 @@ from collections import OrderedDict
 import logging
 from django.contrib.auth.mixins import PermissionRequiredMixin
 from django.contrib.auth.models import Group
-from django.db.models import Case, Count, IntegerField, Sum, When
 from django.db.models.functions import Lower
 from django.urls import reverse, reverse_lazy
 from django.views.generic import CreateView, DeleteView, DetailView, ListView, UpdateView
@@ -14,25 +13,20 @@ logger = logging.getLogger("zentral.accounts.views.groups")
 
 class GroupsView(PermissionRequiredMixin, ListView):
     permission_required = 'auth.view_group'
-    model = Group
     template_name = "accounts/group_list.html"
 
     def get_queryset(self):
-        return (
-            super().get_queryset()
-                   .annotate(
-                       user_count=Sum(
-                           Case(When(user__is_service_account=False, then=1),
-                                default=0,
-                                output_field=IntegerField())
-                       ),
-                       service_account_count=Sum(
-                           Case(When(user__is_service_account=1, then=1),
-                                default=0,
-                                output_field=IntegerField())
-                       ),
-                       realm_group_mapping_count=Count("realmgroupmapping", distinct=True)
-                   ).order_by(Lower("name"))
+        return Group.objects.raw(
+            "select g.*, g.name,"
+            "(select count(*) from accounts_user u "
+            " join accounts_user_groups ug on (ug.user_id = u.id) "
+            " where ug.group_id=g.id and is_service_account = TRUE) service_account_count,"
+            "(select count(*) from accounts_user u "
+            " join accounts_user_groups ug on (ug.user_id = u.id) "
+            " where ug.group_id=g.id and is_service_account = FALSE) user_count,"
+            "(select count(*) from realms_rolemapping rrm"
+            " where rrm.group_id=g.id) role_mapping_count "
+            "from auth_group g order by g.name"
         )
 
 
@@ -69,13 +63,14 @@ class GroupView(PermissionRequiredMixin, DetailView):
         service_accounts = qs.filter(is_service_account=True)
         ctx["service_accounts"] = service_accounts
         ctx["service_account_count"] = service_accounts.count()
-        realm_group_mappings = (
-            self.object.realmgroupmapping_set.all()
-                       .select_related("realm")
-                       .order_by(Lower("claim"), Lower("value"))
+        # role mappings
+        role_mappings = (
+            self.object.rolemapping_set.all()
+                       .select_related("realm_group")
+                       .order_by(Lower("realm_group__display_name"))
         )
-        ctx["realm_group_mappings"] = realm_group_mappings
-        ctx["realm_group_mapping_count"] = realm_group_mappings.count()
+        ctx["role_mappings"] = role_mappings
+        ctx["role_mapping_count"] = role_mappings.count()
         return ctx
 
 

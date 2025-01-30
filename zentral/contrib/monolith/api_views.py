@@ -1,33 +1,31 @@
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django_filters import rest_framework as filters
 from rest_framework import generics
+from rest_framework.authentication import SessionAuthentication
 from rest_framework.exceptions import ValidationError
 from rest_framework.parsers import JSONParser
 from rest_framework.response import Response
 from rest_framework.serializers import ModelSerializer
 from rest_framework.views import APIView
-from zentral.contrib.inventory.models import MetaBusinessUnit
-from zentral.utils.drf import DjangoPermissionRequired, DefaultDjangoModelPermissions
+from accounts.api_authentication import APITokenAuthentication
+from base.notifier import notifier
+from zentral.utils.drf import (DjangoPermissionRequired, DefaultDjangoModelPermissions,
+                               ListCreateAPIViewWithAudit, RetrieveUpdateDestroyAPIViewWithAudit)
 from zentral.utils.http import user_agent_and_ip_address_from_request
-from .conf import monolith_conf
 from .events import post_monolith_cache_server_update_request, post_monolith_sync_catalogs_request
-from .models import CacheServer, Manifest
-from .serializers import ManifestSerializer
-
-
-class SyncRepository(APIView):
-    permission_required = (
-        "monolith.view_catalog", "monolith.add_catalog", "monolith.change_catalog",
-        "monolith.view_pkginfoname", "monolith.add_pkginfoname", "monolith.change_pkginfoname",
-        "monolith.view_pkginfo", "monolith.add_pkginfo", "monolith.change_pkginfo",
-        "monolith.change_manifest"
-    )
-    permission_classes = [DjangoPermissionRequired]
-
-    def post(self, request, *args, **kwargs):
-        post_monolith_sync_catalogs_request(request)
-        monolith_conf.repository.sync_catalogs()
-        return Response({"status": 0})
+from .models import (CacheServer, Catalog, Condition, Enrollment,
+                     Manifest, ManifestCatalog, ManifestEnrollmentPackage,  ManifestSubManifest,
+                     Repository,
+                     SubManifest, SubManifestPkgInfo)
+from .repository_backends import load_repository_backend
+from .serializers import (CatalogSerializer, ConditionSerializer,
+                          EnrollmentSerializer,
+                          ManifestCatalogSerializer, ManifestEnrollmentPackageSerializer,
+                          ManifestSerializer, ManifestSubManifestSerializer,
+                          RepositorySerializer,
+                          SubManifestSerializer, SubManifestPkgInfoSerializer)
+from .utils import build_configuration_plist, build_configuration_profile
 
 
 class CacheServerSerializer(ModelSerializer):
@@ -62,9 +60,164 @@ class UpdateCacheServer(APIView):
         return Response({"status": 0})
 
 
-class ManifestFilter(filters.FilterSet):
-    meta_business_unit_id = filters.ModelChoiceFilter(queryset=MetaBusinessUnit.objects.all())
-    name = filters.CharFilter()
+# repositories
+
+
+class SyncRepository(APIView):
+    permission_required = "monolith.sync_repository"
+    permission_classes = [DjangoPermissionRequired]
+
+    def post(self, request, *args, **kwargs):
+        self.db_repository = get_object_or_404(Repository, pk=kwargs["pk"])
+        post_monolith_sync_catalogs_request(request, self.db_repository)
+        repository = load_repository_backend(self.db_repository)
+        repository.sync_catalogs(request)
+        return Response({"status": 0})
+
+
+class RepositoryList(ListCreateAPIViewWithAudit):
+    queryset = Repository.objects.all()
+    serializer_class = RepositorySerializer
+    filterset_fields = ('name',)
+
+    def on_commit_callback_extra(self, instance):
+        notifier.send_notification("monolith.repository", str(instance.pk))
+
+
+class RepositoryDetail(RetrieveUpdateDestroyAPIViewWithAudit):
+    queryset = Repository.objects.all()
+    serializer_class = RepositorySerializer
+
+    def on_commit_callback_extra(self, instance):
+        notifier.send_notification("monolith.repository", str(instance.pk))
+
+    def perform_destroy(self, instance):
+        if not instance.can_be_deleted():
+            raise ValidationError('This repository cannot be deleted')
+        return super().perform_destroy(instance)
+
+    def perform_update(self, serializer):
+        if not serializer.instance.can_be_updated():
+            raise ValidationError('This repository cannot be updated')
+        return super().perform_update(serializer)
+
+
+# catalogs
+
+
+class CatalogList(generics.ListCreateAPIView):
+    queryset = Catalog.objects.all()
+    serializer_class = CatalogSerializer
+    permission_classes = (DefaultDjangoModelPermissions,)
+    filter_backends = (filters.DjangoFilterBackend,)
+    filterset_fields = ('name',)
+
+
+class CatalogDetail(generics.RetrieveUpdateDestroyAPIView):
+    queryset = Catalog.objects.all()
+    serializer_class = CatalogSerializer
+    permission_classes = (DefaultDjangoModelPermissions,)
+
+    def perform_destroy(self, instance):
+        if not instance.can_be_deleted():
+            raise ValidationError('This catalog cannot be deleted')
+        return super().perform_destroy(instance)
+
+
+# conditions
+
+
+class ConditionList(generics.ListCreateAPIView):
+    queryset = Condition.objects.all()
+    serializer_class = ConditionSerializer
+    permission_classes = (DefaultDjangoModelPermissions,)
+    filter_backends = (filters.DjangoFilterBackend,)
+    filterset_fields = ('name',)
+
+
+class ConditionDetail(generics.RetrieveUpdateDestroyAPIView):
+    queryset = Condition.objects.all()
+    serializer_class = ConditionSerializer
+    permission_classes = (DefaultDjangoModelPermissions,)
+
+    def perform_destroy(self, instance):
+        if not instance.can_be_deleted():
+            raise ValidationError('This condition cannot be deleted')
+        return super().perform_destroy(instance)
+
+
+# enrollments
+
+
+class EnrollmentList(generics.ListCreateAPIView):
+    """
+    List all Enrollments or create a new Enrollment
+    """
+    queryset = Enrollment.objects.all()
+    permission_classes = [DefaultDjangoModelPermissions]
+    serializer_class = EnrollmentSerializer
+    filter_backends = (filters.DjangoFilterBackend,)
+    filterset_fields = ('manifest_id',)
+
+
+class EnrollmentDetail(generics.RetrieveUpdateDestroyAPIView):
+    """
+    Retrieve, update or delete an Enrollment
+    """
+    queryset = Enrollment.objects.all()
+    permission_classes = [DefaultDjangoModelPermissions]
+    serializer_class = EnrollmentSerializer
+
+    def perform_destroy(self, instance):
+        if not instance.can_be_deleted():
+            raise ValidationError('This enrollment cannot be deleted')
+        manifest = instance.manifest
+        response = super().perform_destroy(instance)
+        manifest.bump_version()
+        return response
+
+
+class EnrollmentConfiguration(APIView):
+    """
+    base enrollment configuration class. To be subclassed.
+    """
+    authentication_classes = [APITokenAuthentication, SessionAuthentication]
+    permission_required = "monolith.view_enrollment"
+    permission_classes = [DjangoPermissionRequired]
+
+    def get_content(self, enrollment):
+        raise NotImplementedError
+
+    def get(self, request, *args, **kwargs):
+        enrollment = get_object_or_404(Enrollment, pk=kwargs["pk"])
+        filename, content_type, content = self.get_content(enrollment)
+        response = HttpResponse(content, content_type=content_type)
+        response["Content-Disposition"] = 'attachment; filename="{}"'.format(filename)
+        response["Content-Length"] = len(content)
+        return response
+
+
+class EnrollmentPlist(EnrollmentConfiguration):
+    """
+    Download enrollment plist file
+    """
+
+    def get_content(self, enrollment):
+        filename, content = build_configuration_plist(enrollment)
+        return filename, "application/x-plist", content
+
+
+class EnrollmentConfigurationProfile(EnrollmentConfiguration):
+    """
+    Download enrollment configuration_profile
+    """
+
+    def get_content(self, enrollment):
+        filename, content = build_configuration_profile(enrollment)
+        return filename, "application/octet-stream", content
+
+
+# manifests
 
 
 class ManifestList(generics.ListCreateAPIView):
@@ -72,10 +225,116 @@ class ManifestList(generics.ListCreateAPIView):
     serializer_class = ManifestSerializer
     permission_classes = [DefaultDjangoModelPermissions]
     filter_backends = (filters.DjangoFilterBackend,)
-    filterset_class = ManifestFilter
+    filterset_fields = ("meta_business_unit_id", "name")
 
 
 class ManifestDetail(generics.RetrieveUpdateDestroyAPIView):
     queryset = Manifest.objects.all()
     serializer_class = ManifestSerializer
     permission_classes = [DefaultDjangoModelPermissions]
+
+
+# manifest catalogs
+
+
+class ManifestCatalogList(generics.ListCreateAPIView):
+    queryset = ManifestCatalog.objects.all()
+    serializer_class = ManifestCatalogSerializer
+    permission_classes = [DefaultDjangoModelPermissions]
+    filter_backends = (filters.DjangoFilterBackend,)
+    filterset_fields = ("manifest_id", "catalog_id")
+
+
+class ManifestCatalogDetail(generics.RetrieveUpdateDestroyAPIView):
+    queryset = ManifestCatalog.objects.all()
+    serializer_class = ManifestCatalogSerializer
+    permission_classes = [DefaultDjangoModelPermissions]
+
+    def perform_destroy(self, instance):
+        manifest = instance.manifest
+        response = super().perform_destroy(instance)
+        manifest.bump_version()
+        return response
+
+
+class ManifestEnrollmentPackageList(generics.ListCreateAPIView):
+    queryset = ManifestEnrollmentPackage.objects.all()
+    serializer_class = ManifestEnrollmentPackageSerializer
+    permission_classes = [DefaultDjangoModelPermissions]
+    filter_backends = (filters.DjangoFilterBackend,)
+    filterset_fields = ("manifest_id", "builder")
+
+
+class ManifestEnrollmentPackageDetail(generics.RetrieveUpdateDestroyAPIView):
+    queryset = ManifestEnrollmentPackage.objects.all()
+    serializer_class = ManifestEnrollmentPackageSerializer
+    permission_classes = [DefaultDjangoModelPermissions]
+
+    def perform_destroy(self, instance):
+        manifest = instance.manifest
+        instance.delete(delete_enrollment=False)
+        manifest.bump_version()
+
+
+# manifest sub manifests
+
+
+class ManifestSubManifestList(generics.ListCreateAPIView):
+    queryset = ManifestSubManifest.objects.all()
+    serializer_class = ManifestSubManifestSerializer
+    permission_classes = [DefaultDjangoModelPermissions]
+    filter_backends = (filters.DjangoFilterBackend,)
+    filterset_fields = ("manifest_id", "sub_manifest_id")
+
+
+class ManifestSubManifestDetail(generics.RetrieveUpdateDestroyAPIView):
+    queryset = ManifestSubManifest.objects.all()
+    serializer_class = ManifestSubManifestSerializer
+    permission_classes = [DefaultDjangoModelPermissions]
+
+    def perform_destroy(self, instance):
+        manifest = instance.manifest
+        response = super().perform_destroy(instance)
+        manifest.bump_version()
+        return response
+
+
+# sub manifests
+
+
+class SubManifestList(generics.ListCreateAPIView):
+    queryset = SubManifest.objects.all()
+    serializer_class = SubManifestSerializer
+    permission_classes = [DefaultDjangoModelPermissions]
+    filter_backends = (filters.DjangoFilterBackend,)
+    filterset_fields = ('name',)
+
+
+class SubManifestDetail(generics.RetrieveUpdateDestroyAPIView):
+    queryset = SubManifest.objects.all()
+    serializer_class = SubManifestSerializer
+    permission_classes = [DefaultDjangoModelPermissions]
+
+
+# sub manifest pkg infos
+
+
+class SubManifestPkgInfoList(generics.ListCreateAPIView):
+    queryset = SubManifestPkgInfo.objects.all()
+    serializer_class = SubManifestPkgInfoSerializer
+    permission_classes = [DefaultDjangoModelPermissions]
+    filter_backends = (filters.DjangoFilterBackend,)
+    filterset_fields = ('sub_manifest_id',)
+
+
+class SubManifestPkgInfoDetail(generics.RetrieveUpdateDestroyAPIView):
+    queryset = SubManifestPkgInfo.objects.all()
+    serializer_class = SubManifestPkgInfoSerializer
+    permission_classes = [DefaultDjangoModelPermissions]
+
+    def perform_destroy(self, instance):
+        sub_manifest = instance.sub_manifest
+        response = super().perform_destroy(instance)
+        for _, manifest in sub_manifest.manifests_with_tags():
+            manifest.bump_version()
+        return response

@@ -11,20 +11,15 @@ class TestZentralApps(SimpleTestCase):
         "incidents",
         "inventory",
         "jamf",
-        "jamf_protect",
         "mdm",
         "monolith",
         "munki",
-        "nagios",
         "probes",
         "puppet",
-        "okta",
         "osquery",
         "realms",
         "santa",
-        "simplemdm",
         "wsone",
-        "zendesk",
     ]
 
     def test_zentral_apps(self):

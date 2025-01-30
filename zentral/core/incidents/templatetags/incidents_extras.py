@@ -15,10 +15,11 @@ def incident_severity(severity, default=""):
     color_dict = {
         300: "ff0000",
         200: "ff9900",
-        100: "ffff00",
+        100: "DDDD00",
     }
     color = color_dict.get(severity, "000000")
-    style = {'background-color': "#" + color,
+    style = {'white-space': 'nowrap',
+             'background-color': "#" + color,
              'color': "#" + text_color_for_background_color(color)}
     if color.upper() in ["FFFFFF", "FFF"]:
         style['border'] = '1px solid grey'
@@ -28,7 +29,7 @@ def incident_severity(severity, default=""):
     except ValueError:
         severity_display = escape(str(severity))
     return mark_safe(
-        f'<span class="label" style="{style_str}">'
-        f'{severity_display}&nbsp;<i class="fas fa-skull-crossbones"></i>'
+        f'<span class="label rounded p-1" style="{style_str}">'
+        f'{severity_display}&nbsp;<i class="bi bi-exclamation-triangle-fill"></i>'
         '</span>'
     )

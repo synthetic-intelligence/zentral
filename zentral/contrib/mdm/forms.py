@@ -2,33 +2,54 @@ import base64
 import hashlib
 import json
 import logging
+import os.path
 import plistlib
+import zipfile
 from dateutil import parser
 from django import forms
-from django.db import transaction
-from django.db.models import Q
-from realms.utils import build_password_hash_dict
-from .app_manifest import build_enterprise_app_manifest
+from django.db import IntegrityError, transaction
+from django.db.models import Count, Q
+from zentral.contrib.inventory.models import Tag
+from zentral.utils.os_version import make_comparable_os_version
+from zentral.utils.passwords import build_password_hash_dict
+from .app_manifest import read_package_info, validate_configuration
 from .apps_books import AppsBooksClient
-from .crypto import load_push_certificate_and_key
-from .declarations import update_blueprint_declaration_items
+from .artifacts import update_blueprint_serialized_artifacts
+from .commands.set_recovery_lock import validate_recovery_password
+from .crypto import generate_push_certificate_key_bytes, load_push_certificate_and_key
+from .declarations import get_declaration_info
 from .dep import decrypt_dep_token
 from .dep_client import DEPClient
-from .models import (Artifact, ArtifactType, ArtifactVersion, BlueprintArtifact, Channel,
+from .payloads import get_configuration_profile_info
+from .models import (Artifact, ArtifactVersion, ArtifactVersionTag,
+                     Blueprint, BlueprintArtifact, BlueprintArtifactTag, Channel,
+                     DataAsset, Declaration, DeclarationRef,
                      DEPDevice, DEPOrganization, DEPEnrollment, DEPToken, DEPVirtualServer,
                      EnrolledDevice, EnterpriseApp, Platform,
-                     SCEPConfig,
+                     FileVaultConfig, RecoveryPasswordConfig, SCEPConfig,
                      OTAEnrollment, UserEnrollment, PushCertificate,
-                     Profile, Location, LocationAsset, StoreApp)
+                     Profile, Location, LocationAsset, StoreApp,
+                     SoftwareUpdateEnforcement)
+from .skip_keys import skippable_setup_panes
 
 
 logger = logging.getLogger("zentral.contrib.mdm.forms")
 
 
+class PlatformsWidget(forms.CheckboxSelectMultiple):
+    def __init__(self, attrs=None, choices=()):
+        super().__init__(attrs, choices=Platform.choices)
+
+    def format_value(self, value):
+        if isinstance(value, str) and value:
+            value = [v.strip() for v in value.split(",")]
+        return super().format_value(value)
+
+
 class OTAEnrollmentForm(forms.ModelForm):
     class Meta:
         model = OTAEnrollment
-        fields = ("name", "realm", "push_certificate",
+        fields = ("name", "display_name", "realm", "push_certificate",
                   "scep_config", "scep_verification",
                   "blueprint")
 
@@ -36,39 +57,54 @@ class OTAEnrollmentForm(forms.ModelForm):
 class UserEnrollmentForm(forms.ModelForm):
     class Meta:
         model = UserEnrollment
-        fields = ("name", "realm", "push_certificate",
+        fields = ("name", "display_name", "realm", "push_certificate",
                   "scep_config", "scep_verification",
                   "blueprint")
 
+    def clean(self):
+        cleaned_data = super().clean()
+        if not cleaned_data.get("realm"):
+            self.add_error("realm", "This field is required")
+        return cleaned_data
 
-class UserEnrollmentEnrollForm(forms.Form):
-    managed_apple_id = forms.EmailField(label="Email", required=True)
 
-
-class PushCertificateForm(forms.ModelForm):
-    certificate_file = forms.FileField(required=True)
-    key_file = forms.FileField(required=True)
-    key_password = forms.CharField(widget=forms.PasswordInput, required=False)
+class CreatePushCertificateForm(forms.ModelForm):
+    view_title = "Create"
+    view_action = "Create MDM push certificate"
 
     class Meta:
         model = PushCertificate
         fields = ("name",)
 
+    def save(self, *args, **kwargs):
+        push_certificate = super().save()
+        push_certificate.set_private_key(generate_push_certificate_key_bytes())
+        push_certificate.save()
+        return push_certificate
+
+
+class BasePushCertificateForm(forms.ModelForm):
+    certificate_file = forms.FileField(required=True)
+
+    class Meta:
+        model = PushCertificate
+        fields = ("name",)
+
+    def get_key_bytes():
+        raise NotImplementedError
+
     def clean(self):
         cleaned_data = super().clean()
         certificate_file = cleaned_data.pop("certificate_file", None)
-        key_file = cleaned_data.pop("key_file", None)
-        key_password = cleaned_data.pop("key_password", None)
-        if certificate_file and key_file:
+        key_bytes, key_password = self.get_key_bytes()
+        if certificate_file and key_bytes:
             try:
                 push_certificate_d = load_push_certificate_and_key(
                     certificate_file.read(),
-                    key_file.read(), key_password
+                    key_bytes, key_password
                 )
             except ValueError as e:
                 raise forms.ValidationError(str(e))
-            except Exception:
-                raise forms.ValidationError("Could not load certificate or key file")
             if self.instance.topic:
                 if push_certificate_d["topic"] != self.instance.topic:
                     raise forms.ValidationError("The new certificate has a different topic")
@@ -81,26 +117,159 @@ class PushCertificateForm(forms.ModelForm):
     def save(self):
         push_certificate_d = self.cleaned_data.pop("push_certificate_d")
         self.instance.name = self.cleaned_data["name"]
+        private_key = None
         for k, v in push_certificate_d.items():
             if k == "private_key":
-                self.instance.set_private_key(v)
+                private_key = v
             else:
                 setattr(self.instance, k, v)
         self.instance.save()
+        if private_key:
+            self.instance.set_private_key(private_key)
+            self.instance.save()
         return self.instance
 
 
+class PushCertificateForm(BasePushCertificateForm):
+    key_file = forms.FileField(required=True)
+    key_password = forms.CharField(widget=forms.PasswordInput, required=False)
+
+    def get_key_bytes(self):
+        key_file = self.cleaned_data.pop("key_file", None)
+        key_password = self.cleaned_data.pop("key_password", None)
+        return key_file.read(), key_password
+
+    @property
+    def view_title(self):
+        if self.instance.pk:
+            return "Renew"
+        else:
+            return "Upload"
+
+    @property
+    def view_action(self):
+        if self.instance.pk:
+            return "Renew MDM push certificate and key"
+        else:
+            return "Upload MDM push certificate and key"
+
+
+class PushCertificateCertificateForm(BasePushCertificateForm):
+    view_title = "Upload"
+    view_action = "Upload MDM push certificate"
+
+    def get_key_bytes(self):
+        return self.instance.get_private_key(), None
+
+
+class DEPDeviceSearchForm(forms.Form):
+    template_name = "django/forms/search.html"
+
+    q = forms.CharField(required=False,
+                        widget=forms.TextInput(attrs={"placeholder": "Serial number",
+                                                      "autofocus": True}))
+    enrollment = forms.ModelChoiceField(queryset=DEPEnrollment.objects.all(), required=False, empty_label="Enrollment")
+    server = forms.ModelChoiceField(queryset=DEPVirtualServer.objects.all(), required=False, empty_label="Server")
+    include_deleted = forms.BooleanField(label="Incl. deleted?", required=False)
+
+    def get_queryset(self):
+        qs = DEPDevice.objects.all().order_by("-updated_at")
+        q = self.cleaned_data.get("q")
+        if q:
+            qs = qs.filter(Q(serial_number__icontains=q))
+        include_deleted = self.cleaned_data.get("include_deleted")
+        if not include_deleted:
+            qs = qs.exclude(last_op_type=DEPDevice.OP_TYPE_DELETED)
+        enrollment = self.cleaned_data.get("enrollment")
+        if enrollment:
+            qs = qs.filter(enrollment=enrollment)
+        server = self.cleaned_data.get("server")
+        if server:
+            qs = qs.filter(virtual_server=server)
+        qs = qs.order_by("-updated_at")
+        return qs
+
+    def get_redirect_to(self):
+        if self.has_changed():
+            qs = self.get_queryset()
+            if qs.count() == 1:
+                return qs.first()
+
+
 class EnrolledDeviceSearchForm(forms.Form):
+    template_name = "django/forms/search.html"
+
     q = forms.CharField(required=False,
                         widget=forms.TextInput(attrs={"placeholder": "Serial number, UDID",
                                                       "autofocus": True}))
+    platform = forms.ChoiceField(
+        choices=[("", "..."), ] + [(p.value, p.value) for p in Platform], required=False)
+    blueprint = forms.ModelChoiceField(queryset=Blueprint.objects.all(), required=False, empty_label="...")
 
     def get_queryset(self):
         qs = EnrolledDevice.objects.all().order_by("-updated_at")
         q = self.cleaned_data.get("q")
         if q:
             qs = qs.filter(Q(serial_number__icontains=q) | Q(udid__icontains=q))
+        platform = self.cleaned_data.get("platform")
+        if platform:
+            qs = qs.filter(platform=platform)
+        blueprint = self.cleaned_data.get("blueprint")
+        if blueprint:
+            qs = qs.filter(blueprint=blueprint)
         return qs
+
+    def get_redirect_to(self):
+        if self.has_changed():
+            qs = self.get_queryset()
+            if qs.count() == 1:
+                return qs.first()
+
+
+class ArtifactSearchForm(forms.Form):
+    template_name = "django/forms/search.html"
+
+    q = forms.CharField(required=False,
+                        widget=forms.TextInput(attrs={"placeholder": "Name, Profile ID, Bundle ID",
+                                                      "size": 24,
+                                                      "autofocus": True}))
+    artifact_type = forms.ChoiceField(
+        choices=[("", "..."), ] + Artifact.Type.choices, required=False)
+    channel = forms.ChoiceField(
+        choices=[("", "..."), ] + Channel.choices, required=False)
+    platform = forms.ChoiceField(
+        choices=[("", "..."), ] + [(p.value, p.value) for p in Platform], required=False)
+    blueprint = forms.ModelChoiceField(queryset=Blueprint.objects.all(), required=False, empty_label="...")
+
+    def get_queryset(self):
+        qs = Artifact.objects.annotate(Count("blueprintartifact", distinct=True)).order_by("name")
+        q = self.cleaned_data.get("q")
+        if q:
+            qs = qs.filter(
+                Q(name__icontains=q)
+                | Q(artifactversion__enterprise_app__product_id__icontains=q)
+                | Q(artifactversion__profile__payload_identifier__icontains=q)
+                | Q(artifactversion__store_app__location_asset__asset__bundle_id__icontains=q)
+            )
+        artifact_type = self.cleaned_data.get("artifact_type")
+        if artifact_type:
+            qs = qs.filter(type=artifact_type)
+        channel = self.cleaned_data.get("channel")
+        if channel:
+            qs = qs.filter(channel=channel)
+        platform = self.cleaned_data.get("platform")
+        if platform:
+            qs = qs.filter(platforms__contains=[platform])
+        blueprint = self.cleaned_data.get("blueprint")
+        if blueprint:
+            qs = qs.filter(blueprintartifact__blueprint=blueprint)
+        return qs
+
+    def get_redirect_to(self):
+        if self.has_changed():
+            qs = self.get_queryset()
+            if qs.count() == 1:
+                return qs.first()
 
 
 class EncryptedDEPTokenForm(forms.ModelForm):
@@ -176,6 +345,18 @@ class EncryptedDEPTokenForm(forms.ModelForm):
         return dep_token
 
 
+class UpdateDEPVirtualServerForm(forms.ModelForm):
+    class Meta:
+        model = DEPVirtualServer
+        fields = "__all__"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["default_enrollment"].queryset = self.fields["default_enrollment"].queryset.filter(
+            virtual_server=self.instance
+        )
+
+
 class CreateDEPEnrollmentForm(forms.ModelForm):
     admin_password = forms.CharField(required=False, widget=forms.PasswordInput)
 
@@ -190,13 +371,20 @@ class CreateDEPEnrollmentForm(forms.ModelForm):
             "support_phone_number", "support_email_address",
             "org_magic", "department", "language", "region"
         ]
-        for pane, initial in self.Meta.model.SKIPPABLE_SETUP_PANES:
+        for key, content in skippable_setup_panes:
             if self.instance.pk:
-                initial = pane in self.instance.skip_setup_items
-            self.fields[pane] = forms.BooleanField(label="Skip {} pane".format(pane), initial=initial, required=False)
-            field_order.append(pane)
-        field_order.extend(["realm", "use_realm_user", "realm_user_is_admin",
-                            "admin_full_name", "admin_short_name", "admin_password"])
+                initial = key in self.instance.skip_setup_items
+            else:
+                initial = False
+            self.fields[f"ssp-{key}"] = forms.BooleanField(
+                label=content,
+                initial=initial,
+                required=False
+            )
+            field_order.append(key)
+        field_order.extend(["display_name", "realm", "use_realm_user", "username_pattern", "realm_user_is_admin",
+                            "admin_full_name", "admin_short_name", "admin_password",
+                            "ios_max_version", "ios_min_version", "macos_max_version", "macos_min_version"])
         self.order_fields(field_order)
         self.fields["language"].choices = sorted(self.fields["language"].choices, key=lambda t: (t[1], t[0]))
         self.fields["region"].choices = sorted(self.fields["region"].choices, key=lambda t: (t[1], t[0]))
@@ -219,12 +407,42 @@ class CreateDEPEnrollmentForm(forms.ModelForm):
             raise forms.ValidationError("This option is only valid if a 'realm' is selected")
         return use_realm_user
 
+    def clean_username_pattern(self):
+        use_realm_user = self.cleaned_data.get("use_realm_user")
+        username_pattern = self.cleaned_data.get("username_pattern")
+        if not use_realm_user:
+            if username_pattern:
+                raise forms.ValidationError("This field can only be used if the 'use realm user' option is ticked")
+        else:
+            if not username_pattern:
+                raise forms.ValidationError("This field is required when the 'use realm user' option is ticked")
+        return username_pattern
+
     def clean_realm_user_is_admin(self):
         use_realm_user = self.cleaned_data.get("use_realm_user")
         realm_user_is_admin = self.cleaned_data.get("realm_user_is_admin")
         if realm_user_is_admin and not use_realm_user:
             raise forms.ValidationError("This option is only valid if the 'use realm user' option is ticked too")
         return realm_user_is_admin
+
+    def _clean_os_version(self, platform, limit):
+        fieldname = f"{platform}_{limit}_version"
+        min_version = self.cleaned_data.get(fieldname)
+        if min_version and make_comparable_os_version(min_version) == (0, 0, 0):
+            raise forms.ValidationError("Not a valid OS version")
+        return min_version
+
+    def clean_ios_max_version(self):
+        return self._clean_os_version("ios", "max")
+
+    def clean_ios_min_version(self):
+        return self._clean_os_version("ios", "min")
+
+    def clean_macos_max_version(self):
+        return self._clean_os_version("macos", "max")
+
+    def clean_macos_min_version(self):
+        return self._clean_os_version("macos", "min")
 
     def clean_admin_password(self):
         password = self.cleaned_data.get("admin_password")
@@ -237,14 +455,25 @@ class CreateDEPEnrollmentForm(forms.ModelForm):
                         for i in ("admin_full_name", "admin_short_name", "admin_password_hash")
                     ) if attr]) in (1, 2)
 
+    def has_admin_info(self):
+        return self.cleaned_data.get("admin_full_name") and not self.admin_info_incomplete()
+
+    def update_password(self):
+        return not self.admin_info_incomplete()
+
+    def reset_password(self):
+        return False
+
     def clean(self):
         super().clean()
         skip_setup_items = []
-        for pane, initial in self.Meta.model.SKIPPABLE_SETUP_PANES:
-            if self.cleaned_data.get(pane, False):
-                skip_setup_items.append(pane)
+        for key, _ in skippable_setup_panes:
+            if self.cleaned_data.get(f"ssp-{key}", False):
+                skip_setup_items.append(key)
         if self.admin_info_incomplete():
             raise forms.ValidationError("Admin information incomplete")
+        if self.has_admin_info() and not self.cleaned_data.get("await_device_configured"):
+            self.add_error("await_device_configured", "Required for the admin account setup")
         self.cleaned_data['skip_setup_items'] = skip_setup_items
 
     def save(self, *args, **kwargs):
@@ -252,7 +481,10 @@ class CreateDEPEnrollmentForm(forms.ModelForm):
         kwargs["commit"] = False
         dep_profile = super().save(**kwargs)
         dep_profile.skip_setup_items = self.cleaned_data["skip_setup_items"]
-        dep_profile.admin_password_hash = self.cleaned_data.get("admin_password_hash")
+        if self.update_password():
+            dep_profile.admin_password_hash = self.cleaned_data.get("admin_password_hash")
+        elif self.reset_password():
+            dep_profile.admin_password_hash = None
         if commit:
             dep_profile.save()
         return dep_profile
@@ -268,12 +500,34 @@ class UpdateDEPEnrollmentForm(CreateDEPEnrollmentForm):
         model = DEPEnrollment
         exclude = ("virtual_server",)
 
-    def clean_admin_password(self):
-        password = self.cleaned_data.get("admin_password")
-        if password:
-            self.cleaned_data["admin_password_hash"] = build_password_hash_dict(password)
-        else:
-            self.cleaned_data["admin_password_hash"] = self.instance.admin_password_hash
+    def admin_info_incomplete(self):
+        attr_count = len(
+            [attr for attr in (
+                 self.cleaned_data.get(i)
+                 for i in ("admin_full_name", "admin_short_name", "admin_password_hash")
+             ) if attr]
+        )
+        return (attr_count == 1 or
+                (attr_count == 2 and (
+                    # full or short name missing
+                    self.cleaned_data.get("admin_password_hash")
+                    # password missing and not already present in the object
+                    or not self.instance.admin_password_hash
+                )))
+
+    def update_password(self):
+        return (
+            self.cleaned_data.get("admin_full_name")
+            and self.cleaned_data.get("admin_short_name")
+            and self.cleaned_data.get("admin_password_hash")
+        )
+
+    def reset_password(self):
+        return (
+            not self.cleaned_data.get("admin_full_name")
+            and not self.cleaned_data.get("admin_short_name")
+            and not self.cleaned_data.get("admin_password_hash")
+        )
 
 
 class AssignDEPDeviceEnrollmentForm(forms.ModelForm):
@@ -288,198 +542,576 @@ class AssignDEPDeviceEnrollmentForm(forms.ModelForm):
             profile_f.queryset = profile_f.queryset.filter(virtual_server=self.instance.virtual_server)
 
 
-class UploadEnterpriseAppForm(forms.Form):
+class AppConfigurationMixin(forms.Form):
+    configuration = forms.CharField(
+        required=False,
+        widget=forms.Textarea(attrs={"rows": 10}),
+        help_text="The property list representation of the managed app configuration."
+    )
+
+    def set_initial_config(self):
+        configuration_plist = self.instance.get_configuration_plist()
+        if configuration_plist:
+            self.fields["configuration"].initial = configuration_plist
+
+    def clean_configuration(self):
+        configuration = self.cleaned_data.pop("configuration")
+        try:
+            return validate_configuration(configuration)
+        except ValueError as e:
+            raise forms.ValidationError(str(e))
+
+
+class BaseEnterpriseAppForm(forms.ModelForm, AppConfigurationMixin):
     package = forms.FileField(required=True,
-                              help_text="macOS distribution package (.pkg)")
+                              help_text="macOS distribution package (.pkg) "
+                                        "or iOS/iPadOS/tvOS application archive (.ipa)")
+
+    class Meta:
+        model = EnterpriseApp
+        fields = [
+            "package",
+            "ios_app",
+            "install_as_managed",
+            "remove_on_unenroll",
+        ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields['ios_app'].label = "iOS app"
 
     def clean(self):
+        super().clean()
+        # package
         package = self.cleaned_data.get("package")
-        if package:
-            try:
-                title, product_id, product_version, manifest, bundles = build_enterprise_app_manifest(package)
-            except Exception as e:
-                raise forms.ValidationError(f"Invalid package: {e}")
-            if title is None:
-                title = product_id
-            name = f"{title} - {product_version}"
-            if (
-                Artifact.objects.exclude(
-                    artifactversion__enterprise_app__product_id=product_id,
-                    artifactversion__enterprise_app__product_version=product_version
-                ).filter(name=name).count()
-            ):
-                raise forms.ValidationError(
-                    "An artifact with the same name but a different product already exists"
-                )
-            self.cleaned_data["name"] = name
-            self.cleaned_data["filename"] = package.name
-            self.cleaned_data["product_id"] = product_id
-            self.cleaned_data["product_version"] = product_version
-            self.cleaned_data["manifest"] = manifest
-            self.cleaned_data["bundles"] = bundles
-            return self.cleaned_data
+        if not package:
+            return
+        try:
+            name, platforms, ea_data = read_package_info(package, compute_sha256=True)
+        except Exception as e:
+            raise forms.ValidationError(f"Invalid app: {e}")
+        self.cleaned_data["name"] = name
+        self.cleaned_data["filename"] = package.name
+        self.cleaned_data["platforms"] = platforms
+        self.cleaned_data.update(ea_data)
+        # management
+        install_as_managed = self.cleaned_data.get("install_as_managed")
+        remove_on_unenroll = self.cleaned_data.get("remove_on_unenroll")
+        if not install_as_managed and remove_on_unenroll:
+            self.add_error("remove_on_unenroll", "Only available if installed as managed is also set")
 
+
+class UploadEnterpriseAppForm(BaseEnterpriseAppForm):
     def save(self):
         cleaned_data = self.cleaned_data
-        product_id = cleaned_data["product_id"]
-        product_version = cleaned_data["product_version"]
         name = cleaned_data.pop("name")
-        operation = None
-        enterprise_apps = (EnterpriseApp.objects.select_for_update()
-                                                .filter(product_id=product_id,
-                                                        product_version=product_version)
-                                                .select_related("artifact_version__artifact"))
-        enterprise_app = enterprise_apps.order_by("-artifact_version__version").first()
-        if enterprise_app is None:
-            operation = "created"
-            artifact = Artifact.objects.create(name=name,
-                                               type=ArtifactType.EnterpriseApp.name,
-                                               channel=Channel.Device.name,
-                                               platforms=[Platform.macOS.name])
-            artifact_version = ArtifactVersion.objects.create(artifact=artifact, version=1)
-            EnterpriseApp.objects.create(artifact_version=artifact_version, **cleaned_data)
+        platforms = cleaned_data.pop("platforms")
+        platform_kwargs = {platform.value.lower(): True for platform in platforms}
+        for i in range(100):
+            try:
+                with transaction.atomic():
+                    artifact = Artifact.objects.create(name=name,
+                                                       type=Artifact.Type.ENTERPRISE_APP,
+                                                       channel=Channel.DEVICE,
+                                                       platforms=platforms)
+            except IntegrityError:
+                name = f"{name} ({i + 1})"
+            else:
+                break
         else:
-            artifact = enterprise_app.artifact_version.artifact
-            if enterprise_app.manifest != cleaned_data["manifest"]:
-                operation = "updated"
-                artifact_version = ArtifactVersion.objects.create(artifact=artifact,
-                                                                  version=enterprise_app.artifact_version.version + 1)
-                EnterpriseApp.objects.create(artifact_version=artifact_version, **cleaned_data)
-                artifact.name = name
-                artifact.trashed_at = None
-                artifact.save()
-        return artifact, operation
+            raise RuntimeError("Could not find unique name for artifact")
+        artifact_version = ArtifactVersion.objects.create(
+            artifact=artifact,
+            version=1,
+            **platform_kwargs,
+        )
+        EnterpriseApp.objects.create(artifact_version=artifact_version, **cleaned_data)
+        return artifact
 
 
-class UploadProfileForm(forms.Form):
+class UpgradeEnterpriseAppForm(BaseEnterpriseAppForm):
+    def __init__(self, *args, **kwargs):
+        self.artifact = kwargs.pop("artifact")
+        # hack to clear the field.
+        # we do not want to show the package associated to the latest version (= instance)
+        kwargs["instance"].package = None
+        super().__init__(*args, **kwargs)
+
+    def clean(self):
+        super().clean()
+        if "product_id" not in self.cleaned_data:
+            return
+        if self.instance.product_id != self.cleaned_data["product_id"]:
+            self.add_error(
+                "package",
+                "The product ID of the new app is not identical to the product ID of the latest version"
+            )
+        has_changed = False
+        for k in ("manifest",
+                  "configuration",
+                  "install_as_managed",
+                  "remove_on_unenroll"):
+            old_val = getattr(self.instance, k)
+            if hasattr(old_val, "tobytes"):  # memory view
+                old_val = old_val.tobytes()
+            new_val = self.cleaned_data.get(k)
+            if old_val != new_val:
+                has_changed = True
+                break
+        if not has_changed:
+            self.add_error(None, "This version of the enterprise app is identical to the latest version")
+
+    def save(self, artifact_version):
+        self.instance.id = None  # force insert
+        self.instance.artifact_version = artifact_version
+        # save non-field attributes (configuration is not editable, so not a standard "field")
+        for attr in ("package_sha256",
+                     "package_size",
+                     "configuration",
+                     "filename",
+                     "product_id",
+                     "product_version",
+                     "bundles",
+                     "manifest"):
+            setattr(self.instance, attr, self.cleaned_data[attr])
+        return super().save()
+
+
+class BaseDeclarationForm(forms.ModelForm):
+    artifact_type = None  # see subclasses
+    source = forms.CharField(required=True, widget=forms.Textarea)
+
+    class Meta:
+        model = Declaration
+        fields = []
+
+    def get_channel(self):
+        raise NotImplementedError
+
+    def get_platforms(self):
+        raise NotImplementedError
+
+    def verify_type(self, declaration_type):
+        if self.artifact_type.is_activation:
+            type_prefix = "com.apple.activation."
+        elif self.artifact_type.is_asset:
+            type_prefix = "com.apple.asset."
+        elif self.artifact_type.is_configuration:
+            type_prefix = "com.apple.configuration."
+        else:
+            # should never happen
+            raise RuntimeError("Unsupported artifact type")
+        if not declaration_type.startswith(type_prefix):
+            raise forms.ValidationError(f"Invalid declaration Type for {self.artifact_type}")
+
+    def verify_identifier(self, identifier):
+        pass
+
+    def verify_server_token(self, server_token):
+        if Declaration.objects.filter(server_token=server_token).exists():
+            raise forms.ValidationError("A declaration with this ServerToken already exists")
+
+    def verify_payload(self, payload):
+        pass
+
+    def clean(self):
+        source = self.cleaned_data.get("source")
+        channel = self.get_channel()
+        platforms = self.get_platforms()
+        if source and channel and platforms:
+            try:
+                info = get_declaration_info(source, channel, platforms, ensure_server_token=True)
+            except ValueError as e:
+                self.add_error("source", str(e))
+            else:
+                try:
+                    self.verify_type(info["type"])
+                    self.verify_identifier(info["identifier"])
+                    self.verify_server_token(info["server_token"])
+                    self.verify_payload(info["payload"])
+                except forms.ValidationError as e:
+                    self.add_error("source", e)
+                else:
+                    self.cleaned_data["refs"] = info.pop("refs")
+                    for attr, val in info.items():
+                        setattr(self.instance, attr, val)
+
+    def save_refs(self):
+        for path, ref_artifact in self.cleaned_data["refs"].items():
+            DeclarationRef.objects.create(declaration=self.instance, key=path, artifact=ref_artifact)
+
+
+class CreateDeclarationForm(BaseDeclarationForm):
+    name = forms.CharField(min_length=1, max_length=256, required=True)
+    channel = forms.ChoiceField(choices=Channel.choices, required=True)
+    platforms = forms.MultipleChoiceField(choices=Platform.choices, widget=PlatformsWidget, required=True)
+
+    def __init__(self, *args, **kwargs):
+        self.artifact_type = kwargs.pop("artifact_type")
+        super().__init__(*args, **kwargs)
+
+    def get_channel(self):
+        channel = self.cleaned_data.get("channel")
+        if channel:
+            return Channel(channel)
+
+    def get_platforms(self):
+        platforms = self.cleaned_data.get("platforms")
+        if platforms:
+            return [Platform(p) for p in platforms]
+        return []
+
+    def clean_name(self):
+        name = self.cleaned_data.get("name")
+        if name and Artifact.objects.filter(name=name).exists():
+            raise forms.ValidationError("An artifact with this name already exists")
+        return name
+
+    def verify_identifier(self, identifier):
+        super().verify_identifier(identifier)
+        if Declaration.objects.filter(identifier=identifier).exists():
+            raise forms.ValidationError("A declaration with this Identifier already exists")
+
+    def save(self):
+        artifact = Artifact.objects.create(name=self.cleaned_data["name"],
+                                           type=self.artifact_type,
+                                           channel=self.cleaned_data["channel"],
+                                           platforms=self.cleaned_data["platforms"])
+        self.instance.artifact_version = ArtifactVersion.objects.create(
+            artifact=artifact,
+            version=1,
+            **{platform.lower(): True for platform in self.cleaned_data["platforms"]}
+        )
+        super().save()
+        self.save_refs()
+        return artifact
+
+
+class UpgradeDeclarationForm(BaseDeclarationForm):
+    def __init__(self, *args, **kwargs):
+        self.artifact = kwargs.pop("artifact")
+        self.artifact_type = self.artifact.get_type()
+        super().__init__(*args, **kwargs)
+
+    def get_channel(self):
+        return self.artifact.get_channel()
+
+    def get_platforms(self):
+        return self.artifact.get_platforms()
+
+    def verify_type(self, declaration_type):
+        super().verify_type(declaration_type)
+        if not declaration_type == self.instance.type:
+            raise forms.ValidationError("The new declaration Type is different from the existing one")
+
+    def verify_identifier(self, identifier):
+        super().verify_identifier(identifier)
+        if not identifier == self.instance.identifier:
+            raise forms.ValidationError("The new declaration Identifier is different from the existing one")
+
+    def verify_payload(self, payload):
+        super().verify_payload(payload)
+        if payload == self.instance.payload:
+            raise forms.ValidationError("The new declaration Payload is the same as the latest one")
+
+    def save(self, artifact_version):
+        self.instance.id = None  # force insert
+        self.instance.artifact_version = artifact_version
+        declaration = super().save()
+        self.save_refs()
+        return declaration
+
+
+class BaseDataAssetForm(forms.ModelForm):
+    file = forms.FileField(required=True)
+
+    class Meta:
+        model = DataAsset
+        fields = ["type", "file"]
+
+    def clean(self):
+        data_asset_type = self.cleaned_data.get("type")
+        file = self.cleaned_data.get("file")
+        if not data_asset_type or not file:
+            return
+        # verify type + file
+        _, ext = os.path.splitext(file.name)
+        data_asset_type = DataAsset.Type(data_asset_type)
+        if data_asset_type == DataAsset.Type.PLIST:
+            if not ext == ".plist":
+                self.add_error("file", "File name must have a .plist extension")
+                return
+            try:
+                plistlib.load(file, fmt=plistlib.FMT_XML)  # Only XML files because of the mimetype
+            except Exception:
+                self.add_error("file", "Invalid PLIST file")
+                return
+            else:
+                file.seek(0)
+        elif data_asset_type == DataAsset.Type.ZIP:
+            if not ext == ".zip":
+                self.add_error("file", "File name must have a .zip extension")
+                return
+            if not zipfile.is_zipfile(file):
+                self.add_error("file", "Invalid ZIP file")
+                return
+        # update instance
+        self.instance.filename = file.name
+        self.instance.file_size = file.size
+        # calculate hash
+        h = hashlib.sha256()
+        for chunk in file.chunks():
+            h.update(chunk)
+        self.cleaned_data["file_sha256"] = h.hexdigest()
+
+
+class UploadDataAssetForm(BaseDataAssetForm):
+    name = forms.CharField(min_length=1, max_length=256, required=True)
+    platforms = forms.MultipleChoiceField(choices=Platform.choices, widget=PlatformsWidget, required=True)
+
+    def clean_name(self):
+        name = self.cleaned_data.get("name")
+        if name and Artifact.objects.filter(name=name).exists():
+            raise forms.ValidationError("An artifact with the same name already exists.")
+        return name
+
+    def save(self):
+        artifact = Artifact.objects.create(name=self.cleaned_data["name"],
+                                           type=Artifact.Type.DATA_ASSET,
+                                           channel=Channel.DEVICE,
+                                           platforms=self.cleaned_data["platforms"])
+        self.instance.type = self.cleaned_data["type"]
+        self.instance.file_sha256 = self.cleaned_data["file_sha256"]
+        self.instance.artifact_version = ArtifactVersion.objects.create(
+            artifact=artifact,
+            version=1,
+            **{platform.lower(): True for platform in self.cleaned_data["platforms"]}
+        )
+        super().save()
+        return artifact
+
+
+class UpgradeDataAssetForm(BaseDataAssetForm):
+    def __init__(self, *args, **kwargs):
+        self.artifact = kwargs.pop("artifact")
+        super().__init__(*args, **kwargs)
+        self.fields["type"].disabled = True
+
+    def clean(self):
+        super().clean()
+        if self.cleaned_data:
+            if self.instance.file_sha256 == self.cleaned_data["file_sha256"]:
+                self.add_error("file", "This file is not different from the latest one.")
+
+    def save(self, artifact_version):
+        self.instance.id = None  # force insert
+        self.instance.type = self.cleaned_data["type"]
+        self.instance.file_sha256 = self.cleaned_data["file_sha256"]
+        self.instance.artifact_version = artifact_version
+        return super().save()
+
+
+class BaseProfileForm(forms.ModelForm):
     source_file = forms.FileField(required=True,
                                   help_text="configuration profile file (.mobileconfig)")
 
-    def clean(self):
-        source_file = self.cleaned_data.get("source_file")
-        if source_file:
-            try:
-                payload = plistlib.load(source_file)
-            except Exception:
-                self.add_error("source_file", "This file is not a plist.")
-                return self.cleaned_data
-            # identifier
-            try:
-                self.cleaned_data["payload_identifier"] = payload_identifier = payload["PayloadIdentifier"]
-            except KeyError:
-                self.add_error("source_file", "Missing PayloadIdentifier.")
-                return self.cleaned_data
-            # existing profile
-            self.cleaned_data["profile"] = profile = (
-                Profile.objects.select_for_update()
-                               .filter(payload_identifier=payload_identifier)
-                               .select_related("artifact_version__artifact")
-                               .first()
-            )
-            # channel
-            payload_scope = payload.get("PayloadScope", "User")
-            if payload_scope == "System":
-                channel = Channel.Device.name
-            elif payload_scope == "User":
-                channel = Channel.User.name
-            else:
-                self.add_error("source_file", f"Unknown PayloadScope: {payload_scope}.")
-                return self.cleaned_data
-            if profile and channel != profile.artifact_version.artifact.channel:
-                self.add_error(
-                    "source_file",
-                    "Existing profile with same payload identifier has a different channel."
-                )
-                return self.cleaned_data
-            self.cleaned_data["channel"] = channel
-            # uuid
-            try:
-                self.cleaned_data["payload_uuid"] = payload["PayloadUUID"]
-            except KeyError:
-                self.add_error("source_file", "Missing PayloadUUID.")
-                return self.cleaned_data
-            # other keys
-            for payload_key, obj_key in (("PayloadDisplayName", "payload_display_name"),
-                                         ("PayloadDescription", "payload_description")):
-                self.cleaned_data[obj_key] = payload.get(payload_key) or ""
-            # name check
-            name = self.cleaned_data.get("payload_display_name") or self.cleaned_data["payload_uuid"]
-            if (
-                Artifact.objects.exclude(
-                    artifactversion__profile__payload_identifier=self.cleaned_data["payload_identifier"]
-                ).filter(name=name).count()
-            ):
-                self.add_error(
-                    "source_file",
-                    "An artifact with the same name but a different payload identifier already exists."
-                )
-                return self.cleaned_data
-            self.cleaned_data["name"] = name
-            # source
-            source_file = self.cleaned_data.pop("source_file")
-            source_file.seek(0)
-            self.cleaned_data["source"] = source_file.read()
-            self.cleaned_data["filename"] = source_file.name
-            return self.cleaned_data
+    class Meta:
+        model = Profile
+        fields = []
 
+    def clean(self):
+        source_file = self.cleaned_data.pop("source_file")
+        if not source_file:
+            return
+        # read payload
+        data = source_file.read()
+        try:
+            data, info = get_configuration_profile_info(data)
+        except ValueError as e:
+            self.add_error("source_file", str(e))
+        else:
+            self.cleaned_data["source"] = data
+            self.instance.filename = source_file.name
+            for attr, val in info.items():
+                if attr != "channel":
+                    setattr(self.instance, attr, val)
+                else:
+                    self.cleaned_data[attr] = val
+
+
+class UploadProfileForm(BaseProfileForm):
     def save(self):
         cleaned_data = self.cleaned_data
-        name = cleaned_data.pop("name")
+        name = self.instance.payload_display_name or self.instance.payload_identifier
         channel = cleaned_data.pop("channel")
-        profile = cleaned_data.pop("profile")
-        operation = None
-        if profile is None:
-            operation = "created"
-            artifact = Artifact.objects.create(name=name,
-                                               type=ArtifactType.Profile.name,
-                                               channel=channel,
-                                               platforms=Platform.all_values())
-            artifact_version = ArtifactVersion.objects.create(artifact=artifact, version=1)
-            Profile.objects.create(artifact_version=artifact_version, **cleaned_data)
+        for i in range(100):
+            try:
+                with transaction.atomic():
+                    artifact = Artifact.objects.create(name=name,
+                                                       type=Artifact.Type.PROFILE,
+                                                       channel=channel,
+                                                       platforms=Platform.values)
+            except IntegrityError:
+                name = f"{name} ({i + 1})"
+            else:
+                break
         else:
-            artifact = profile.artifact_version.artifact
-            if profile.source.tobytes() != cleaned_data["source"]:
-                operation = "updated"
-                artifact_version = ArtifactVersion.objects.create(artifact=artifact,
-                                                                  version=profile.artifact_version.version + 1)
-                Profile.objects.create(artifact_version=artifact_version, **cleaned_data)
-                artifact.name = name
-                artifact.channel = channel
-                artifact.trashed_at = None
-                artifact.save()
-            elif artifact.trashed_at:
-                artifact.trashed_at = None
-                artifact.save()
-        for blueprint_artifact in artifact.blueprintartifact_set.select_related("blueprint").all():
-            update_blueprint_declaration_items(blueprint_artifact.blueprint, commit=True)
-        return artifact, operation
+            raise RuntimeError("Could not find unique name for artifact")
+        self.instance.artifact_version = ArtifactVersion.objects.create(
+            artifact=artifact,
+            version=1,
+            **{platform.lower(): True for platform in Platform.values}
+        )
+        self.instance.source = self.cleaned_data["source"]
+        super().save()
+        return artifact
 
 
-class PlatformsWidget(forms.CheckboxSelectMultiple):
-    def __init__(self, attrs=None, choices=()):
-        super().__init__(attrs, choices=Platform.choices())
+class UpgradeProfileForm(BaseProfileForm):
+    def __init__(self, *args, **kwargs):
+        self.artifact = kwargs.pop("artifact")
+        super().__init__(*args, **kwargs)
 
-    def format_value(self, value):
-        if isinstance(value, str) and value:
-            value = [v.strip() for v in value.split(",")]
-        return super().format_value(value)
+    def clean(self):
+        super().clean()
+        if self.cleaned_data:
+            # check channel
+            if self.cleaned_data.get("channel") != self.artifact.get_channel():
+                self.add_error("source_file",
+                               "The channel of the profile must match the channel of the artifact.")
+            if self.instance.source.tobytes() == self.cleaned_data["source"]:
+                self.add_error("source_file",
+                               "This profile is not different from the latest one.")
+
+    def save(self, artifact_version):
+        self.instance.id = None  # force insert
+        self.instance.source = self.cleaned_data["source"]
+        self.instance.artifact_version = artifact_version
+        return super().save()
 
 
 class UpdateArtifactForm(forms.ModelForm):
     class Meta:
         model = Artifact
-        fields = ("platforms",)
+        exclude = ["type", "channel"]
         widgets = {"platforms": PlatformsWidget}
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.artifact_type = self.instance.get_type()
+        if self.artifact_type in (Artifact.Type.STORE_APP,):
+            del self.fields["platforms"]
+        if not self.artifact_type.can_be_linked_to_blueprint:
+            del self.fields["requires"]
+            del self.fields["install_during_setup_assistant"]
+        else:
+            self.fields["requires"].queryset = self.fields["requires"].queryset.exclude(pk=self.instance.pk)
+            if self.artifact_type.is_ddm_only:
+                del self.fields["install_during_setup_assistant"]
+        if self.artifact_type.is_declaration:
+            self.fields["auto_update"].disabled = True
 
-class BlueprintArtifactForm(forms.ModelForm):
-    class Meta:
-        model = BlueprintArtifact
-        fields = ("blueprint", "priority", "install_before_setup_assistant", "auto_update")
+    def save(self):
+        if not self.artifact_type.can_be_linked_to_blueprint:
+            self.instance.requires.clear()
+            self.instance.install_during_setup_assistant = False
+        else:
+            if self.artifact_type.is_ddm_only:
+                self.instance.install_during_setup_assistant = False
+        if self.artifact_type.is_declaration:
+            self.instance.auto_update = True
+        instance = super().save()
+        for blueprint in instance.blueprints():
+            update_blueprint_serialized_artifacts(blueprint)
+        return instance
 
+
+class BlueprintItemFormMixin:
     def __init__(self, *args, **kwargs):
         self.artifact = kwargs.pop("artifact")
         super().__init__(*args, **kwargs)
+        # add a class to the os version checkboxes
+        for visible in self.visible_fields():
+            field = visible.field
+            if isinstance(field, forms.BooleanField):
+                field.widget.attrs["class"] = "os-version-cb"
+        # tag qs
+        tag_qs = Tag.objects.select_related("meta_business_unit", "taxonomy").all()
+        self.fields['excluded_tags'].queryset = tag_qs
+        # tag shards
+        self.tag_shards = []
+        existing_tag_shard_dict = {}
+        if self.instance.pk:
+            existing_tag_shard_dict = {ts["tag"]: ts["shard"] for ts in self.instance.tag_shards}
+        for tag in tag_qs:
+            self.tag_shards.append(
+                (tag, tag in existing_tag_shard_dict, existing_tag_shard_dict.get(tag, self.instance.shard_modulo))
+            )
+        self.tag_shards.sort(key=lambda t: t[0].name.lower())
+
+    def clean(self):
+        super().clean()
+        # platforms & min max versions
+        platform_active = False
+        for platform in Platform.values:
+            field = platform.lower()
+            if not self.cleaned_data.get(field, False):
+                self.cleaned_data[f"{field}_min_version"] = ""
+                self.cleaned_data[f"{field}_max_version"] = ""
+            else:
+                platform_active = True
+                if platform not in self.artifact.platforms:
+                    self.add_error(field, "Platform not available for this artifact")
+        if not platform_active:
+            self.add_error(None, "You need to activate at least one platform")
+        # shards
+        default_shard = self.cleaned_data.get("default_shard")
+        shard_modulo = self.cleaned_data.get("shard_modulo")
+        if default_shard and shard_modulo and shard_modulo < default_shard:
+            self.add_error("default_shard", "Must be less than or equal to the shard modulo")
+        # excluded tags
+        for tag in self.cleaned_data.get("excluded_tags", []):
+            if f"tag-shard-{tag.pk}" in self.data:
+                self.add_error("excluded_tags", f"Conflict with {tag} shard")
+        # tag shards
+        for tag, _, _ in self.tag_shards:
+            try:
+                shard = int(self.data[f"tag-shard-{tag.pk}"])
+            except Exception:
+                continue
+            if isinstance(shard_modulo, int):
+                shard = min(shard, shard_modulo)
+            self.cleaned_data.setdefault("tag_shards", {})[tag] = shard
+
+
+class BlueprintArtifactForm(BlueprintItemFormMixin, forms.ModelForm):
+    class Meta:
+        model = BlueprintArtifact
+        fields = ("blueprint",
+                  "ios", "ios_min_version", "ios_max_version",
+                  "ipados", "ipados_min_version", "ipados_max_version",
+                  "macos", "macos_min_version", "macos_max_version",
+                  "tvos", "tvos_min_version", "tvos_max_version",
+                  "shard_modulo", "default_shard",
+                  "excluded_tags")
+        labels = {
+            "ios": "iOS",
+            "ios_min_version": "min version (incl.)",
+            "ios_max_version": "max version (excl.)",
+            "ipados": "iPadOS",
+            "ipados_min_version": "min version (incl.)",
+            "ipados_max_version": "max version (excl.)",
+            "macos": "macOS",
+            "macos_min_version": "min version (incl.)",
+            "macos_max_version": "max version (excl.)",
+            "tvos": "tvOS",
+            "tvos_min_version": "min version (incl.)",
+            "tvos_max_version": "max version (excl.)",
+        }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # blueprint qs
         current_blueprint_pk = None
         if self.instance.pk:
             current_blueprint_pk = self.instance.blueprint.pk
@@ -493,7 +1125,193 @@ class BlueprintArtifactForm(forms.ModelForm):
 
     def save(self, *args, **kwargs):
         self.instance.artifact = self.artifact
-        return super().save(*args, **kwargs)
+        instance = super().save(*args, **kwargs)
+        # tag shards
+        tag_shards = self.cleaned_data.get("tag_shards", {})
+        instance.item_tags.exclude(tag__in=tag_shards.keys()).delete()
+        for tag, shard in tag_shards.items():
+            BlueprintArtifactTag.objects.update_or_create(
+                blueprint_artifact=instance,
+                tag=tag,
+                defaults={"shard": shard}
+            )
+        # update blueprint
+        update_blueprint_serialized_artifacts(instance.blueprint)
+        return instance
+
+
+class ArtifactVersionForm(BlueprintItemFormMixin, forms.ModelForm):
+    class Meta:
+        model = ArtifactVersion
+        fields = ("ios", "ios_min_version", "ios_max_version",
+                  "ipados", "ipados_min_version", "ipados_max_version",
+                  "macos", "macos_min_version", "macos_max_version",
+                  "tvos", "tvos_min_version", "tvos_max_version",
+                  "shard_modulo", "default_shard",
+                  "excluded_tags")
+        labels = {
+            "ios": "iOS",
+            "ios_min_version": "min version (incl.)",
+            "ios_max_version": "max version (excl.)",
+            "ipados": "iPadOS",
+            "ipados_min_version": "min version (incl.)",
+            "ipados_max_version": "max version (excl.)",
+            "macos": "macOS",
+            "macos_min_version": "min version (incl.)",
+            "macos_max_version": "max version (excl.)",
+            "tvos": "tvOS",
+            "tvos_min_version": "min version (incl.)",
+            "tvos_max_version": "max version (excl.)",
+        }
+
+    def save(self, *args, **kwargs):
+        self.instance.artifact = self.artifact
+        if kwargs.pop("force_insert", False):
+            self.instance.id = None  # force an insert
+            self.instance.version = self.instance.version + 1
+        instance = super().save()
+        # tag shards
+        tag_shards = self.cleaned_data.get("tag_shards", {})
+        instance.item_tags.exclude(tag__in=tag_shards.keys()).delete()
+        for tag, shard in tag_shards.items():
+            ArtifactVersionTag.objects.update_or_create(
+                artifact_version=instance,
+                tag=tag,
+                defaults={"shard": shard}
+            )
+        # update blueprints
+        for blueprint in self.artifact.blueprints():
+            update_blueprint_serialized_artifacts(blueprint)
+        return instance
+
+
+class FileVaultConfigForm(forms.ModelForm):
+    class Meta:
+        model = FileVaultConfig
+        fields = "__all__"
+
+    def clean(self):
+        super().clean()
+        at_login_only = self.cleaned_data.get("at_login_only")
+        if not at_login_only:
+            self.cleaned_data["bypass_attempts"] = -1
+        else:
+            bypass_attempts = self.cleaned_data.get("bypass_attempts")
+            if isinstance(bypass_attempts, int) and bypass_attempts < 0:
+                self.add_error("bypass_attempts", "Must be at least 0 when enablement deferred at login")
+
+
+class RecoveryPasswordConfigForm(forms.ModelForm):
+    static_password = forms.CharField(
+        widget=forms.PasswordInput(render_value=True),
+        validators=[validate_recovery_password],
+        required=False, strip=True
+    )
+    field_order = [
+        "name",
+        "dynamic_password",
+        "static_password",
+        "rotation_interval_days",
+        "rotate_firmware_password",
+    ]
+
+    class Meta:
+        model = RecoveryPasswordConfig
+        fields = "__all__"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.instance.pk:
+            self.fields["static_password"].initial = self.instance.get_static_password() or ""
+
+    def clean(self):
+        super().clean()
+        dynamic_password = self.cleaned_data.get("dynamic_password")
+        if not dynamic_password:
+            static_password = self.cleaned_data.get("static_password")
+            if not static_password and "static_password" not in self.errors:
+                self.add_error("static_password", "This field is required when not using dynamic passwords.")
+            self.cleaned_data["rotation_interval_days"] = 0
+            self.cleaned_data["rotate_firmware_password"] = False
+        else:
+            if (
+                self.cleaned_data.get("rotate_firmware_password")
+                and not self.cleaned_data.get("rotation_interval_days")
+            ):
+                self.add_error("rotate_firmware_password",
+                               "Cannot be set without a rotation interval.")
+
+    def save(self):
+        if self.instance.pk and not self.cleaned_data.get("dynamic_password"):
+            self.instance.set_static_password(None)
+        obj = super().save()
+        if not obj.dynamic_password:
+            obj.set_static_password(self.cleaned_data["static_password"])
+            obj.save()
+        return obj
+
+
+class SoftwareUpdateEnforcementForm(forms.ModelForm):
+    enforcement_type = forms.ChoiceField(
+        label="Type",
+        required=True,
+        widget=forms.RadioSelect,
+        choices=(("ONE_TIME", "One time"),
+                 ("LATEST", "Latest")),
+        initial="LATEST",
+    )
+    field_order = (
+        "name",
+        "details_url",
+        "platforms",
+        "tags",
+        "enforcement_type",
+        "os_version", "build_version", "local_datetime",
+        "max_os_version", "delay_days", "local_time",
+    )
+    latest_fields = ("max_os_version", "delay_days", "local_time")
+    one_time_fields = ("os_version", "build_version", "local_datetime")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for widget_class, fields in (("one-time-enforcement", self.one_time_fields),
+                                     ("latest-enforcement", self.latest_fields),):
+            for field in fields:
+                self.fields[field].widget.attrs["class"] = widget_class
+        if self.instance.pk:
+            self.fields["enforcement_type"].initial = "ONE_TIME" if self.instance.os_version else "LATEST"
+
+    class Meta:
+        model = SoftwareUpdateEnforcement
+        fields = "__all__"
+        widgets = {"platforms": PlatformsWidget}
+
+    def _clean_os_version(self, os_version):
+        if os_version and make_comparable_os_version(os_version) == (0, 0, 0):
+            raise forms.ValidationError("Not a valid OS version")
+        return os_version
+
+    def clean_max_os_version(self):
+        return self._clean_os_version(self.cleaned_data.get("max_os_version"))
+
+    def clean_os_version(self):
+        return self._clean_os_version(self.cleaned_data.get("os_version"))
+
+    def clean(self):
+        super().clean()
+        enforcement_type = self.cleaned_data.get("enforcement_type")
+        if enforcement_type == "ONE_TIME":
+            required_fields = (f for f in self.one_time_fields if f != "build_version")
+            other_fields = self.latest_fields
+        else:
+            required_fields = self.latest_fields
+            other_fields = self.one_time_fields
+        for field in required_fields:
+            value = self.cleaned_data.get(field)
+            if not self.has_error(field) and (value is None or value == ""):
+                self.add_error(field, "This field is required")
+        for field in other_fields:
+            setattr(self.instance, field, "" if field not in ("delay_days", "local_time", "local_datetime") else None)
 
 
 class SCEPConfigForm(forms.ModelForm):
@@ -594,53 +1412,59 @@ class LocationForm(forms.ModelForm):
         return location
 
 
-class StoreAppForm(forms.ModelForm):
-    configuration = forms.CharField(
-        required=False,
-        widget=forms.Textarea(attrs={"rows": 10}),
-        help_text="The property list representation of the managed app configuration."
-    )
+class StoreAppForm(forms.ModelForm, AppConfigurationMixin):
+    field_order = [
+        "associated_domains",
+        "associated_domains_enable_direct_downloads",
+        "configuration",
+        "prevent_backup",
+        "removable",
+        "remove_on_unenroll",
+        "vpn_uuid",
+        "content_filter_uuid",
+        "dns_proxy_uuid"
+    ]
 
     class Meta:
         model = StoreApp
-        fields = (
-            "associated_domains", "associated_domains_enable_direct_downloads",
-            "removable",
-            "vpn_uuid",
+        fields = [
+            "associated_domains",
+            "associated_domains_enable_direct_downloads",
             "content_filter_uuid",
             "dns_proxy_uuid",
+            "prevent_backup",
+            "removable",
             "remove_on_unenroll",
-            "prevent_backup"
-        )
+            "vpn_uuid",
+        ]
         widgets = {
-            "vpn_uuid": forms.TextInput,
             "content_filter_uuid": forms.TextInput,
-            "dns_proxy_uuid": forms.TextInput
+            "dns_proxy_uuid": forms.TextInput,
+            "vpn_uuid": forms.TextInput,
         }
 
-    def clean_configuration(self):
-        configuration = self.cleaned_data.pop("configuration")
-        if configuration:
-            if configuration.startswith("<dict>"):
-                # to make it easier for the users
-                configuration = f'<plist version="1.0">{configuration}</plist>'
-            try:
-                loaded_configuration = plistlib.loads(configuration.encode("utf-8"))
-            except Exception:
-                raise forms.ValidationError("Invalid property list")
-            if not isinstance(loaded_configuration, dict):
-                raise forms.ValidationError("Not a dictionary")
-            configuration = plistlib.dumps(loaded_configuration)
-        return configuration
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.set_initial_config()
 
-    def clean(self):
-        super().clean()
-        # update configuration
-        configuration = self.cleaned_data.get("configuration")
-        if configuration:
-            self.instance.configuration = configuration
-        else:
-            self.instance.configuration = None
+    def save(self, *args, **kwargs):
+        self.instance.configuration = self.cleaned_data["configuration"]
+        return super().save(*args, **kwargs)
+
+    def clean_content_filter_uuid(self):
+        content_filter_uuid = self.cleaned_data.get("content_filter_uuid")
+        if not content_filter_uuid:
+            return None
+
+    def clean_dns_proxy_uuid(self):
+        dns_proxy_uuid = self.cleaned_data.get("dns_proxy_uuid")
+        if not dns_proxy_uuid:
+            return None
+
+    def clean_vpn_uuid(self):
+        vpn_uuid = self.cleaned_data.get("vpn_uuid")
+        if not vpn_uuid:
+            return None
 
 
 class LocationAssetChoiceField(forms.ModelChoiceField):
@@ -651,32 +1475,10 @@ class LocationAssetChoiceField(forms.ModelChoiceField):
 class CreateAssetArtifactForm(StoreAppForm):
     location_asset = LocationAssetChoiceField(label="Location", queryset=LocationAsset.objects.none(), required=True)
     name = forms.CharField(required=True)
-    field_order = (
-        "location_asset",
-        "name",
-        "removable",
-        "remove_on_unenroll",
-        "prevent_backup",
-        "configuration",
-        "associated_domains",
-        "associated_domains_enable_direct_downloads",
-        "vpn_uuid",
-        "content_filter_uuid",
-        "dns_proxy_uuid"
-        "configuration",
-    )
+    field_order = ["name", "location_asset"] + StoreAppForm.field_order
 
     class Meta(StoreAppForm.Meta):
-        fields = (
-            "location_asset",
-            "associated_domains", "associated_domains_enable_direct_downloads",
-            "removable",
-            "vpn_uuid",
-            "content_filter_uuid",
-            "dns_proxy_uuid",
-            "remove_on_unenroll",
-            "prevent_backup"
-        )
+        fields = ["name", "location_asset"] + StoreAppForm.Meta.fields
 
     def clean_name(self):
         name = self.cleaned_data.get("name")
@@ -703,14 +1505,41 @@ class CreateAssetArtifactForm(StoreAppForm):
     def save(self):
         artifact = Artifact.objects.create(
             name=self.cleaned_data["name"],
-            type=ArtifactType.StoreApp.name,
-            channel=Channel.Device.name,
+            type=Artifact.Type.STORE_APP,
+            channel=Channel.DEVICE,
             platforms=self.asset.supported_platforms,
         )
         artifact_version = ArtifactVersion.objects.create(
             artifact=artifact,
+            version=1,
+            **{platform.lower(): True for platform in self.asset.supported_platforms},
         )
         store_app = super().save(commit=False)
         store_app.artifact_version = artifact_version
         store_app.save()
         return store_app
+
+
+class UpgradeStoreAppForm(StoreAppForm):
+    def __init__(self, *args, **kwargs):
+        self.artifact = kwargs.pop("artifact")
+        super().__init__(*args, **kwargs)
+
+    def clean(self):
+        super().clean()
+        has_changed = False
+        for field_name in ["configuration"] + self.Meta.fields:
+            old_val = getattr(self.instance, field_name)
+            if hasattr(old_val, "tobytes"):  # memory view
+                old_val = old_val.tobytes()
+            new_val = self.cleaned_data.get(field_name)
+            if new_val != old_val:
+                has_changed = True
+                break
+        if not has_changed:
+            self.add_error(None, "This version of the store app is identical to the latest version")
+
+    def save(self, artifact_version):
+        self.instance.id = None  # force insert
+        self.instance.artifact_version = artifact_version
+        return super().save()

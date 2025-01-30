@@ -3,29 +3,29 @@
 
 {% block objectextras %}
 <p>
-{% for tag in object.tags %}
-{% inventory_tag tag %}
-{% endfor %}
-{% if object.api_enrollment_enabled %}
-<span class="label label-success">Available for API Enrollment</span>
-{% endif %}
+    {% for tag in object.tags %}
+        {% inventory_tag tag %}
+    {% endfor %}
+    {% if object.api_enrollment_enabled %}
+        <span class="badge text-bg-success">Available for API Enrollment</span>
+    {% endif %}
 </p>
 
-<table class="table">
+<table class="table table-striped align-middle table-hover">
   {% for bu in object.get_current_business_units %}
   <tr>
     <td>{{ bu.source.name }}</td>
     <td>{{ bu.name }}</td>
     <td>
       {% for link in bu.links.all %}
-      <a href="{{ link.url }}" class="btn btn-default">
+      <a href="{{ link.url }}" class="btn btn-outline-secondary">
         {{ bu.source.name }} - {{ link.anchor_text }}
       </a>
       {% endfor %}
     </td>
     <td>
       {% if bu.can_be_detached %}
-      <a href="{% url 'inventory:detach_bu' object.id bu.id %}" class="btn btn-default">
+      <a href="{% url 'inventory:detach_bu' object.id bu.id %}" class="btn btn-outline-secondary">
         Detach
       </a>
       {% endif %}
@@ -34,20 +34,4 @@
   {% endfor %}
 </table>
 
-<p>
-  {% if perms.inventory.change_metabusinessunit %}
-  <a href="{% url 'inventory:update_mbu' object.id %}" class="btn btn-default">Update</a>
-  {% endif %}
-  {% if perms.inventory.view_metabusinessunittag and perms.inventory.add_metabusinessunittag and perms.inventory.change_metabusinessunittag and perms.inventory.delete_metabusinessunittag and perms.inventory.add_tag %}
-  <a href="{% url 'inventory:mbu_tags' object.id %}" class="btn btn-default">Manage tags</a>
-  {% endif %}
-  {% if not object.api_enrollment_enabled and perms.inventory.change_metabusinessunit %}
-  <a href="{% url 'inventory:mbu_api_enrollment' object.id %}" class="btn btn-default">Enable API enrollment</a>
-  {% endif %}
-  {% if object.can_be_deleted and perms.inventory.delete_metabusinessunit %}
-  <a href="{% url 'inventory:delete_mbu' object.id %}" class="btn btn-danger">
-    <span class="glyphicon glyphicon-trash" aria-hidden="true"></span>
-  </a>
-  {% endif %}
-</p>
 {% endblock %}

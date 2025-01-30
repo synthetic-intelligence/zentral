@@ -8,7 +8,11 @@
   },
   "extra_links": [
     {"anchor_text": "Prometheus",
-     "url": "https://zentral/prometheus/"}
+     "url": "https://zentral/prometheus/"},
+     {"anchor_text": "Kibana",
+     "url": "https://zentral/kibana/"},
+     {"anchor_text": "Grafana",
+     "url": "https://zentral/grafana/"}
   ],
   "django": {
     "SECRET_KEY": "DJANGO SECRET !!! CHANGE THIS !!! DO NOT USE IN PRODUCTION !!!",
@@ -19,7 +23,17 @@
     ],
     "MEDIA_ROOT": "/var/zentral",
     "POSTGRES_HOST": "{{ env:POSTGRES_HOST }}",
-    "POSTGRES_PASSWORD": "{{ env:POSTGRES_PASSWORD }}"
+    "POSTGRES_PASSWORD": "{{ env:POSTGRES_PASSWORD }}",
+    "CACHES": {
+      "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": "redis://redis:6379/1",
+        "OPTIONS": {
+          "CLIENT_CLASS": "django_redis.client.DefaultClient",
+          "IGNORE_EXCEPTIONS": true
+        }
+      }
+    }
   },
   "queues": {
     "backend": "zentral.core.queues.backends.kombu",
@@ -48,6 +62,7 @@
     "zentral.core.incidents": {
       "metrics": true
     },
+    "zentral.core.terraform": {},
     "zentral.contrib.inventory": {
       "metrics": true,
       "clients": [
@@ -77,7 +92,6 @@
       ]
     },
     "zentral.contrib.jamf": {},
-    "zentral.contrib.simplemdm": {},
     "zentral.contrib.munki": {
       "metrics": true,
       "principal_user_detection": {
@@ -85,7 +99,6 @@
         "domains": ["zentral.pro"]
       }
     },
-    "zentral.contrib.nagios": {},
     "zentral.contrib.osquery": {},
     "zentral.contrib.santa": {
       "metrics": true

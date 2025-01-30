@@ -5,8 +5,10 @@ from django.contrib.auth.models import Group, Permission
 from django.db.models import Q
 from django.urls import reverse
 from django.utils.crypto import get_random_string
+from django.utils.text import slugify
 from django.test import TestCase, override_settings
 from accounts.models import User
+from zentral.contrib.inventory.models import Tag
 from zentral.contrib.osquery.compliance_checks import sync_query_compliance_check
 from zentral.contrib.osquery.models import Pack, PackQuery, Query
 from zentral.core.compliance_checks.models import ComplianceCheck
@@ -40,12 +42,22 @@ class OsquerySetupQueriesViewsTestCase(TestCase):
             self.group.permissions.clear()
         self.client.force_login(self.user)
 
-    def _force_query(self, force_compliance_check=False):
+    def _force_pack(self):
+        name = get_random_string(12)
+        return Pack.objects.create(name=name.lower(), slug=slugify(name))
+
+    def _force_query(self, force_compliance_check=False, pack_query_mode=None):
         if force_compliance_check:
             sql = "select 'OK' as ztl_status;"
         else:
             sql = "select 1 from processes;"
         query = Query.objects.create(name=get_random_string(12), sql=sql)
+        if pack_query_mode is not None:
+            pack = self._force_pack()
+            PackQuery.objects.create(
+                pack=pack, query=query, interval=60, slug=slugify(query.name), log_removed_actions=False,
+                snapshot_mode=False if pack_query_mode == "diff" else True
+            )
         sync_query_compliance_check(query, force_compliance_check)
         return query
 
@@ -83,6 +95,23 @@ class OsquerySetupQueriesViewsTestCase(TestCase):
         self.assertIsNone(query.compliance_check)
         self.assertEqual(query.version, 1)
 
+    def test_create_query_with_compliance_check_and_tag_error(self):
+        self._login("osquery.add_query", "osquery.view_query")
+        tag = Tag.objects.create(name=get_random_string(12))
+        response = self.client.post(reverse("osquery:create_query"),
+                                    {"name": get_random_string(12),
+                                     "sql": "select 'OK' ztl_status;",
+                                     "tag": tag.pk,
+                                     "description": get_random_string(12),
+                                     "compliance_check": "on"},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "osquery/query_form.html")
+        self.assertFormError(response.context["form"], "compliance_check",
+                             "A query can either be a compliance check or a tag update, not both")
+        self.assertFormError(response.context["form"], "tag",
+                             "A query can either be a compliance check or a tag update, not both")
+
     def test_create_query_with_compliance_check_sql_error(self):
         self._login("osquery.add_query", "osquery.view_query")
         response = self.client.post(reverse("osquery:create_query"),
@@ -93,7 +122,7 @@ class OsquerySetupQueriesViewsTestCase(TestCase):
                                     follow=True)
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "osquery/query_form.html")
-        self.assertFormError(response, "form", "compliance_check",
+        self.assertFormError(response.context["form"], "compliance_check",
                              "The query doesn't contain the 'ztl_status' keyword")
 
     def test_create_query_with_compliance_check(self):
@@ -114,6 +143,24 @@ class OsquerySetupQueriesViewsTestCase(TestCase):
         self.assertEqual(query.version, query.compliance_check.version)
         self.assertEqual(query.compliance_check.model, "OsqueryCheck")
         self.assertEqual(query.compliance_check.query, query)
+
+    def test_create_query_with_tag(self):
+        self._login("osquery.add_query", "osquery.view_query")
+        query_name = get_random_string(12)
+        tag = Tag.objects.create(name=get_random_string(12))
+        response = self.client.post(reverse("osquery:create_query"),
+                                    {"name": query_name,
+                                     "sql": "select 'OK' as ztl_status;",
+                                     "tag": tag.pk,
+                                     "description": "YOLO"}, follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "osquery/query_detail.html")
+        self.assertContains(response, query_name)
+        query = response.context["object"]
+        self.assertEqual(query.name, query_name)
+        self.assertIsNone(query.compliance_check)
+        self.assertEqual(query.version, 1)
+        self.assertEqual(query.tag, tag)
 
     # update query
 
@@ -164,7 +211,7 @@ class OsquerySetupQueriesViewsTestCase(TestCase):
                                     follow=True)
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "osquery/query_form.html")
-        self.assertFormError(response, "form", "compliance_check",
+        self.assertFormError(response.context["form"], "compliance_check",
                              "The query doesn't contain the 'ztl_status' keyword")
 
     def test_update_query_set_compliance_check_pack_error(self):
@@ -181,7 +228,25 @@ class OsquerySetupQueriesViewsTestCase(TestCase):
                                     follow=True)
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "osquery/query_form.html")
-        self.assertFormError(response, "form", "compliance_check",
+        self.assertFormError(response.context["form"], "compliance_check",
+                             f"This query is scheduled in 'diff' mode in the {pack} pack")
+
+    def test_update_query_set_tag_pack_error(self):
+        query = self._force_query()
+        # add a pack to schedule this query in 'diff' mode
+        pack = Pack.objects.create(name=get_random_string(12))
+        PackQuery.objects.create(pack=pack, query=query, interval=600)
+        self._login("osquery.change_query", "osquery.view_query")
+        tag = Tag.objects.create(name=get_random_string(12))
+        response = self.client.post(reverse("osquery:update_query", args=(query.pk,)),
+                                    {"name": query.name,
+                                     "sql": "select 'OK' as ztl_status;",
+                                     "tag": tag.pk,
+                                     "description": query.description},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "osquery/query_form.html")
+        self.assertFormError(response.context["form"], "tag",
                              f"This query is scheduled in 'diff' mode in the {pack} pack")
 
     def test_update_query_set_compliance_check(self):
@@ -243,6 +308,15 @@ class OsquerySetupQueriesViewsTestCase(TestCase):
         self.assertEqual(Query.objects.filter(pk=query.pk).count(), 0)
         self.assertNotContains(response, query.name)
         self.assertEqual(ComplianceCheck.objects.filter(pk=compliance_check_pk).count(), 0)
+
+    def test_delete_scheduled_query(self):
+        query = self._force_query(pack_query_mode="diff")
+        self._login("osquery.delete_query", "osquery.view_query")
+        response = self.client.post(reverse("osquery:delete_query", args=(query.pk,)), follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "osquery/query_list.html")
+        self.assertEqual(Query.objects.filter(pk=query.pk).count(), 0)
+        self.assertNotContains(response, query.name)
 
     # query events
 
@@ -307,9 +381,13 @@ class OsquerySetupQueriesViewsTestCase(TestCase):
         self.assertContains(response, query2.name)
 
     def test_filtered_query_list(self):
+        self._login("osquery.view_query")
+        response = self.client.get(reverse("osquery:queries"))
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "osquery/query_list.html")
+        self.assertNotContains(response, "We didn't find any item related to your search")
         query = self._force_query()
         query2 = self._force_query(force_compliance_check=True)
-        self._login("osquery.view_query")
         response = self.client.get(reverse("osquery:queries") + "?compliance_check=on")
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "osquery/query_list.html")
@@ -317,3 +395,9 @@ class OsquerySetupQueriesViewsTestCase(TestCase):
         self.assertIn(query2, response.context["object_list"])
         self.assertNotContains(response, query.name)
         self.assertContains(response, query2.name)
+        self.assertNotContains(response, "We didn't find any item related to your search")
+        response = self.client.get(reverse("osquery:queries"), {"q": "does not exists"})
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "osquery/query_list.html")
+        self.assertContains(response, "We didn't find any item related to your search")
+        self.assertContains(response, reverse("osquery:queries") + '">all the items')

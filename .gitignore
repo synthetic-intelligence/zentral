@@ -2,6 +2,7 @@
 __pycache__
 *.sw[op]
 *credentials.json
+.ruff_cache
 
 /.*
 !/.gitignore
@@ -19,6 +20,7 @@ __pycache__
 !/docker-compose.saml2.yml
 !/docker-compose.syslog.yml
 !/mkdocs.yml
+!/.readthedocs.yaml
 
 /conf/*
 !/conf/start
@@ -29,3 +31,6 @@ __pycache__
 
 tests/osquery/fixtures/*
 tests/santa/fixtures/*
+
+/server/static/dist/
+/node_modules/

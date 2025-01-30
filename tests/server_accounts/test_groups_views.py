@@ -105,7 +105,7 @@ class AccountUsersViewsTestCase(TestCase):
         self.login("auth.add_group")
         response = self.client.get(reverse("accounts:create_group"))
         self.assertTemplateUsed(response, "accounts/group_form.html")
-        self.assertContains(response, "Groups")
+        self.assertContains(response, "Roles")
         self.assertContains(response, "Create")
 
     def test_create_group_error(self):
@@ -113,7 +113,7 @@ class AccountUsersViewsTestCase(TestCase):
         response = self.client.post(reverse("accounts:create_group"),
                                     {"name": self.group.name},
                                     follow=True)
-        self.assertFormError(response, "form", "name", "Group with this Name already exists.")
+        self.assertFormError(response.context["form"], "name", "Group with this Name already exists.")
 
     def test_create_group_ok(self):
         self.login("auth.add_group", "auth.view_group")
@@ -144,7 +144,7 @@ class AccountUsersViewsTestCase(TestCase):
         response = self.client.post(reverse("accounts:update_group", args=(self.group.pk,)),
                                     {"name": self.group2.name})
         self.assertTemplateUsed(response, "accounts/group_form.html")
-        self.assertFormError(response, "form", "name", "Group with this Name already exists.")
+        self.assertFormError(response.context["form"], "name", "Group with this Name already exists.")
 
     def test_update_group_ok(self):
         self.login("auth.change_group", "auth.view_group")
@@ -169,4 +169,4 @@ class AccountUsersViewsTestCase(TestCase):
                                     follow=True)
         self.assertTemplateUsed(response, "accounts/group_list.html")
         self.assertNotContains(response, group_name)
-        self.assertContains(response, "2 Groups")
+        self.assertContains(response, "Roles (2)")

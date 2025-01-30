@@ -51,7 +51,16 @@ HARDWARE_MODEL_SERIAL_MACHINE_TYPES = [
     ('imac', DESKTOP),
     ('ipad', TABLET),
     ('iphone', MOBILE),
-    ('mac13', DESKTOP),
+    ('mac13,1', DESKTOP),  # Mac Studio (2022)
+    ('mac13,2', DESKTOP),  # Mac Studio (2022)
+    ('mac14,10', LAPTOP),  # MacBook Pro (16-inch, 2023)
+    ('mac14,12', DESKTOP),  # Mac mini (M2 Pro, 2023)
+    ('mac14,2', LAPTOP),  # MacBook Air (M2, 2022)
+    ('mac14,3', DESKTOP),  # Mac mini (M2, 2023)
+    ('mac14,5', LAPTOP),  # MacBook Pro (14-inch, 2023)
+    ('mac14,6', LAPTOP),  # MacBook Pro (16-inch, 2023)
+    ('mac14,7', LAPTOP),  # MacBook Pro (13-inch, M2, 2022)
+    ('mac14,9', LAPTOP),  # MacBook Pro (14-inch, 2023)
     ('macbook', LAPTOP),
     ('macmini', DESKTOP),
     ('macpro', DESKTOP),
@@ -80,6 +89,8 @@ HARDWARE_MODEL_SERIAL_MACHINE_TYPES = [
     ('samsung sm-g', MOBILE),
     ('samsung sm-p', TABLET),
     ('samsung sm-t', TABLET),
+    # OTHERS
+    ('virtual machine', VM),
 ]
 
 
@@ -233,18 +244,37 @@ def macos_version_from_build(build):
         if minor >= 17:
             major = minor - 5
             minor = patch
-            if build in ("21A558", "21A559", "21D62", "21E258", "21G83", "21G217",
-                         "22A400", "22D68"):
+            if build in ("21A558", "21A559", "21D62", "21E258", "21G83", "21G217", "21G920",
+                         "22A400", "22D68", "22E261", "22E772610a", "22F82", "22F770820b", "22F770820d",
+                         "22G90", "22G313", "22H221",
+                         "23B81", "23B2082", "23C71", "23D60", "23G93", "23H222",
+                         "24A348", "24B91"):
                 patch = 1
-            elif build in ("21G309", "21G320"):
+            elif build in ("21G309", "21G320", "21G1974",
+                           "22G91", "22G320",
+                           "23B2091", "23B92"):
                 patch = 2
-            elif build in ("21G417", "21G419"):
+            elif build in ("21G417", "21G419", "21H1015", "22G436"):
                 patch = 3
+            elif build in ("21G526", "21H1123", "22G513"):
+                patch = 4
+            elif build in ("21G531", "21H1222", "22G621"):
+                patch = 5
+            elif build in ("21G646", "21H1320", "22G630"):
+                patch = 6
+            elif build in ("21G651", "22G720"):
+                patch = 7
+            elif build in ("21G725", "22G820"):
+                patch = 8
+            elif build in ("21G726", "22G830"):
+                patch = 9
             else:
                 patch = 0
-            if patch_letter >= "G" and patch_number >= 115:
+            if patch_letter >= "G" and major == 12 and patch_number >= 816:
+                minor = 7
+            elif patch_letter == "G" and major in (12, 13) and patch_number >= 115:
                 minor = 6
-            elif minor > 0:
+            elif patch_letter < "H" and minor > 0 and major < 14:
                 minor -= 1
         elif minor == 16:
             major = 11
@@ -260,27 +290,37 @@ def macos_version_from_build(build):
                 patch = 2
             elif build in ("20D91", "20G415", "20G1116"):
                 patch = 3
-            elif build == "20G417":
+            elif build in ("20G417", "20G1120"):
                 patch = 4
-            elif build == "20G527":
+            elif build in ("20G527", "20G1225"):
                 patch = 5
-            elif build == "20G624":
+            elif build in ("20G624", "20G1231"):
                 patch = 6
-            elif build == "20G630":
+            elif build in ("20G630", "20G1345"):
                 patch = 7
-            elif build == "20G730":
+            elif build in ("20G730", "20G1351"):
                 patch = 8
+            elif build == "20G1426":
+                patch = 9
+            elif build == "20G1427":
+                patch = 10
             else:
                 patch = 0
         else:
             major = 10
-        return {
+        os_version = {
             "name": name,
             "major": major,
             "minor": minor,
             "patch": patch,
             "build": build
         }
+        # RSR
+        if build in ("22E772610a", "22F770820b"):
+            os_version["version"] = "(a)"
+        elif build == "22F770820d":
+            os_version["version"] = "(c)"
+        return os_version
     else:
         raise ValueError("Bad build number")
 

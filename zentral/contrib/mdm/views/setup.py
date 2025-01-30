@@ -1,20 +1,24 @@
 import io
-import json
 import logging
 from django.contrib.auth.mixins import LoginRequiredMixin, PermissionRequiredMixin
-from django.core.exceptions import SuspiciousOperation
-from django.http import (FileResponse, HttpResponse, HttpResponseBadRequest, HttpResponseForbidden,
-                         HttpResponseRedirect)
+from django.core.exceptions import PermissionDenied, SuspiciousOperation
+from django.http import FileResponse, Http404, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, render
 from django.urls import reverse, reverse_lazy
 from django.views.generic import CreateView, DeleteView, DetailView, ListView, TemplateView, UpdateView, View
+from zentral.contrib.mdm.crypto import generate_push_certificate_csr_der_bytes
 from zentral.contrib.mdm.dep import add_dep_token_certificate
-from zentral.contrib.mdm.events import post_apps_books_notification_event
-from zentral.contrib.mdm.forms import EncryptedDEPTokenForm, PushCertificateForm, LocationForm
+from zentral.contrib.mdm.forms import (CreatePushCertificateForm,
+                                       EncryptedDEPTokenForm, LocationForm,
+                                       PushCertificateCertificateForm, PushCertificateForm,
+                                       UpdateDEPVirtualServerForm)
 from zentral.contrib.mdm.models import PushCertificate, DEPToken, DEPVirtualServer, Location
 from zentral.contrib.mdm.payloads import (build_configuration_profile_response,
                                           build_root_ca_configuration_profile)
-from zentral.utils.http import user_agent_and_ip_address_from_request
+from zentral.contrib.mdm.push_csr_signers import signer as push_csr_signer
+from zentral.contrib.mdm.terraform import iter_resources
+from zentral.utils.terraform import build_config_response
+
 
 logger = logging.getLogger('zentral.contrib.mdm.views.setup')
 
@@ -22,10 +26,32 @@ logger = logging.getLogger('zentral.contrib.mdm.views.setup')
 class IndexView(LoginRequiredMixin, TemplateView):
     template_name = "mdm/index.html"
 
+    def get_context_data(self, **kwargs):
+        if not self.request.user.has_module_perms("mdm"):
+            raise PermissionDenied("Not allowed")
+        ctx = super().get_context_data(**kwargs)
+        ctx["show_terraform_export"] = all(
+            self.request.user.has_perm(perm)
+            for perm in TerraformExportView.permission_required
+        )
+        return ctx
+
 
 class RootCAView(View):
     def get(self, request, *args, **kwargs):
         return build_configuration_profile_response(build_root_ca_configuration_profile(), "zentral_root_ca")
+
+
+# terraform export
+
+
+class TerraformExportView(PermissionRequiredMixin, View):
+    permission_required = (
+        "mdm.view_blueprint",
+    )
+
+    def get(self, request, *args, **kwargs):
+        return build_config_response(iter_resources(), "terraform_mdm")
 
 
 # Push certificates
@@ -36,10 +62,16 @@ class PushCertificatesView(PermissionRequiredMixin, ListView):
     model = PushCertificate
 
 
-class AddPushCertificateView(PermissionRequiredMixin, CreateView):
+class UploadPushCertificateView(PermissionRequiredMixin, CreateView):
     permission_required = "mdm.add_pushcertificate"
     model = PushCertificate
     form_class = PushCertificateForm
+
+
+class CreatePushCertificateView(PermissionRequiredMixin, CreateView):
+    permission_required = "mdm.add_pushcertificate"
+    model = PushCertificate
+    form_class = CreatePushCertificateForm
 
 
 class PushCertificateView(PermissionRequiredMixin, DetailView):
@@ -51,10 +83,48 @@ class PushCertificateView(PermissionRequiredMixin, DetailView):
         ctx["dep_enrollments"] = list(self.object.depenrollment_set.all().order_by("-pk"))
         ctx["ota_enrollments"] = list(self.object.otaenrollment_set.all().order_by("-pk"))
         ctx["user_enrollments"] = list(self.object.userenrollment_set.all().order_by("-pk"))
+        if self.request.user.has_perm("mdm.change_pushcertificate"):
+            if push_csr_signer:
+                ctx["signed_csr_url"] = reverse("mdm:push_certificate_signed_csr", args=(self.object.pk,))
+            else:
+                ctx["csr_url"] = reverse("mdm:push_certificate_csr", args=(self.object.pk,))
         return ctx
 
 
-class UpdatePushCertificateView(PermissionRequiredMixin, UpdateView):
+class PushCertificateCSRView(PermissionRequiredMixin, View):
+    permission_required = "mdm.change_pushcertificate"
+
+    def get(self, request, *args, **kwargs):
+        push_certificate = get_object_or_404(PushCertificate, pk=kwargs["pk"])
+        csr_bytes = generate_push_certificate_csr_der_bytes(push_certificate)
+        return FileResponse(io.BytesIO(csr_bytes),
+                            content_type="application/pkcs10",
+                            as_attachment=True,
+                            filename=f"push_certificate_{push_certificate.pk}.csr")
+
+
+class PushCertificateSignedCSRView(PermissionRequiredMixin, View):
+    permission_required = "mdm.change_pushcertificate"
+
+    def get(self, request, *args, **kwargs):
+        if not push_csr_signer:
+            raise Http404
+        push_certificate = get_object_or_404(PushCertificate, pk=kwargs["pk"])
+        csr = generate_push_certificate_csr_der_bytes(push_certificate)
+        b64_csr = push_csr_signer.get_signed_b64_csr(csr)
+        return FileResponse(io.BytesIO(b64_csr),
+                            content_type="application/octet-stream",
+                            as_attachment=True,
+                            filename=f"push_certificate_{push_certificate.pk}_signed_csr.b64")
+
+
+class UploadPushCertificateCertificateView(PermissionRequiredMixin, UpdateView):
+    permission_required = "mdm.change_pushcertificate"
+    model = PushCertificate
+    form_class = PushCertificateCertificateForm
+
+
+class RenewPushCertificateView(PermissionRequiredMixin, UpdateView):
     permission_required = "mdm.change_pushcertificate"
     model = PushCertificate
     form_class = PushCertificateForm
@@ -185,11 +255,21 @@ class ConnectDEPVirtualServerView(PermissionRequiredMixin, View):
 class DEPVirtualServerView(PermissionRequiredMixin, DetailView):
     permission_required = "mdm.view_depvirtualserver"
     model = DEPVirtualServer
+    latest_devices_count = 5
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
-        context["setup"] = True
+        devices_qs = self.object.depdevice_set.all().order_by("-updated_at")
+        context["devices_count"] = devices_qs.count()
+        context["show_more_devices"] = context["devices_count"] > self.latest_devices_count
+        context["latest_devices"] = devices_qs[:self.latest_devices_count]
         return context
+
+
+class UpdateDEPVirtualServerView(PermissionRequiredMixin, UpdateView):
+    permission_required = "mdm.change_depvirtualserver"
+    model = DEPVirtualServer
+    form_class = UpdateDEPVirtualServerForm
 
 
 # Locations
@@ -209,35 +289,6 @@ class CreateLocationView(PermissionRequiredMixin, CreateView):
 class LocationView(PermissionRequiredMixin, DetailView):
     permission_required = "mdm.view_location"
     model = Location
-
-
-class NotifyLocationView(View):
-    def post(self, request, *args, **kwargs):
-        mdm_info_id = kwargs["mdm_info_id"]
-        http_authorization = request.META.get('HTTP_AUTHORIZATION')
-        if not http_authorization:
-            logger.error("Apps & Books: Empty or missing Authorization header")
-            return HttpResponseForbidden()
-        if not http_authorization.startswith("Bearer "):
-            logger.error("Apps & Books: Malformed Authorization header")
-            return HttpResponseForbidden()
-        notification_auth_token = http_authorization[7:]
-        # TODO: cache?
-        try:
-            location = Location.objects.get_with_mdm_info_id_and_token(
-                mdm_info_id, notification_auth_token
-            )
-        except Location.DoesNotExist:
-            logger.error("Apps & Books: Unknown location")
-            return HttpResponseForbidden()
-        try:
-            data = json.loads(request.body)
-        except ValueError:
-            logger.error("Apps & Books: Could not read notification body")
-            return HttpResponseBadRequest()
-        user_agent, ip = user_agent_and_ip_address_from_request(request)
-        post_apps_books_notification_event(location, user_agent, ip, data)
-        return HttpResponse()
 
 
 class UpdateLocationView(PermissionRequiredMixin, UpdateView):

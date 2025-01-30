@@ -1,46 +1,66 @@
 {% extends 'base.html' %}
-{% load bootstrap inventory_extras %}
+{% load ui_extras %}
 
 {% block content %}
 <ol class="breadcrumb">
-  <li><a href="/">Home</a></li>
-  <li class="active">Munki configurations</li>
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'munki:index' %}">Munki</a></li>
+  <li class="breadcrumb-item active">Configurations</li>
 </ol>
 
-<h2>{{ configuration_count }} Munki configuration{{ configuration_count|pluralize }}</h2>
+    <div class="d-flex align-items-center mb-1">
+        <h2 class="m-0">Configuration{{ configuration_count|pluralize }} ({{ configuration_count }})</h2>
+        <div class="ms-auto">
+            {% if perms.munki.add_configuration %}
+                {% url 'munki:create_configuration' as url %}
+                {% button 'CREATE' url "Create new Configuration" %}
+            {% endif %}
+            {% if perms.munki.view_enrollment %}
+                {% url 'munki:terraform_export' as url %}
+                {% button 'DOWNLOAD' url "Create Terraform Configuration" %}
+            {% endif %}
+        </div>
+    </div>
 
-{% if perms.munki.add_configuration %}
-<p>
-  <a class="btn btn-default" href="{% url 'munki:create_configuration' %}">Create</a>
-</p>
-{% endif %}
-
-{% if configuration_count %}
-<table class="table">
-  <thead>
-    <th>Name</th>
-    {% if perms.munki.change_configuration %}
-    <th></th>
+{% if object_list %}
+    <table class="table table-striped align-middle table-hover">
+    <thead>
+        <th>Name</th>
+        <th>Enrollments</th>
+        <th>Machines</th>
+        {% if perms.munki.change_configuration %}
+        <th></th>
+        {% endif %}
+    </thead>
+    <tbody>
+        {% for configuration in object_list %}
+        <tr class="data-row">
+        <td>
+            <a href="{{ configuration.get_absolute_url }}">{{ configuration }}</a>
+        </td>
+        <td>
+            {{ configuration.enrollment__count }}
+        </td>
+        <td>
+            {{ configuration.enrollment__enrolledmachine__count }}
+        </td>
+        {% if perms.munki.change_configuration %}
+        <td class="text-end py-0">
+            {% url 'munki:update_configuration' configuration.pk as url %}
+            {% button 'UPDATE' url "Edit Configuration" %}
+        </td>
+        {% endif %}
+        </tr>
+        {% endfor %}
+    </tbody>
+    </table>
+{% else %}
+    {% if perms.munki.add_configuration %}
+        {% url 'munki:create_configuration' as link %}
+        {% no_entities 'Munki configurations' link %}
+    {% else %}
+        {% no_entities 'Munki configurations' %}
     {% endif %}
-  </thead>
-  <tbody>
-    {% for configuration in object_list %}
-    <tr>
-      <td>
-        <a href="{{ configuration.get_absolute_url }}">{{ configuration }}</a>
-      </td>
-      {% if perms.munki.change_configuration %}
-      <td>
-        <a class="btn btn-default" href="{% url 'munki:update_configuration' configuration.pk %}">
-          <span class="glyphicon glyphicon-edit" aria-hidden="true"></span>
-          Update
-        </a>
-      </td>
-      {% endif %}
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
 {% endif %}
 
 {% endblock %}

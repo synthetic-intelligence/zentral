@@ -3,12 +3,15 @@ from functools import reduce
 import json
 import operator
 from django.contrib.auth.models import Group, Permission
+from django.core import mail
+from django.core.exceptions import ValidationError
 from django.db.models import Q
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils.crypto import get_random_string
 import pyotp
 from accounts.models import APIToken, User, UserTOTP, UserWebAuthn
+from accounts.password_validation import PasswordNotAlreadyUsedValidator
 from zentral.conf import ConfigDict, settings
 
 
@@ -31,10 +34,9 @@ class AccountUsersViewsTestCase(TestCase):
                                                  get_random_string(12),
                                                  is_superuser=True)
         # user
-        cls.pwd = get_random_string(18)
         cls.user = User.objects.create_user(get_random_string(19),
                                             "{}@zentral.io".format(get_random_string(12)),
-                                            get_random_string(12))
+                                            get_random_string(18))
         # remote user
         cls.remote_user = User.objects.create_user(get_random_string(19),
                                                    "{}@zentral.io".format(get_random_string(12)),
@@ -81,6 +83,7 @@ class AccountUsersViewsTestCase(TestCase):
         self.assertTemplateUsed(response, "base/index.html")
         self.assertTrue(response.context["request"].user.is_authenticated)
         self.assertEqual(response.context["request"].user, self.ui_user)
+        self.assertEqual(response["Cache-Control"], 'max-age=0, no-cache, no-store, must-revalidate, private')
 
     def test_simple_login_wrong_password(self):
         response = self.client.post(reverse("login"),
@@ -90,7 +93,31 @@ class AccountUsersViewsTestCase(TestCase):
         self.assertFalse(response.context["request"].user.is_authenticated)
         self.assertContains(response, "Please enter a correct username and password.")
 
+    def test_simple_login_already_logged_in(self):
+        self.login()
+        response = self.client.get(reverse("login"))
+        self.assertRedirects(response, reverse("base:index"))
+
+    def test_simple_login_already_logged_in_unsafe_redirect(self):
+        self.login()
+        response = self.client.get(reverse("login"), {"next": "https://www.example.com"})
+        self.assertRedirects(response, reverse("base:index"))
+
+    def test_simple_login_already_logged_ok_redirect(self):
+        self.login()
+        response = self.client.get(reverse("login"), {"next": reverse("accounts:profile")})
+        self.assertRedirects(response, reverse("accounts:profile"))
+
     # login + totp
+
+    def test_totp_user_logged_in(self):
+        self.login()
+        response = self.client.get(reverse("accounts:verify_totp"))
+        self.assertRedirects(response, reverse("accounts:profile"))
+
+    def test_totp_no_token(self):
+        response = self.client.get(reverse("accounts:verify_totp"))
+        self.assertRedirects(response, reverse("login"))
 
     def test_login_totp_not_ok(self):
         UserTOTP.objects.create(
@@ -108,7 +135,7 @@ class AccountUsersViewsTestCase(TestCase):
                                     follow=True)
         self.assertTemplateUsed(response, "accounts/verify_totp.html")
         self.assertFalse(response.context["request"].user.is_authenticated)
-        self.assertFormError(response, "form", "verification_code", "Invalid code")
+        self.assertFormError(response.context["form"], "verification_code", "Invalid code")
 
     def test_login_totp_ok(self):
         user_totp = UserTOTP.objects.create(
@@ -128,7 +155,34 @@ class AccountUsersViewsTestCase(TestCase):
         self.assertTrue(response.context["request"].user.is_authenticated)
         self.assertEqual(response.context["request"].user, self.ui_user)
 
+    def test_login_totp_empty_error(self):
+        UserTOTP.objects.create(
+            user=self.ui_user,
+            name=get_random_string(12),
+            secret=pyotp.random_base32(),
+        )
+        response = self.client.post(reverse("login"),
+                                    {"username": self.ui_user.username, "password": self.ui_user_pwd},
+                                    follow=True)
+        self.assertTemplateUsed(response, "accounts/verify_totp.html")
+        self.assertFalse(response.context["request"].user.is_authenticated)
+        response = self.client.post(reverse("accounts:verify_totp"),
+                                    {"verification_code": " "},
+                                    follow=True)
+        self.assertTemplateUsed(response, "accounts/verify_totp.html")
+        self.assertFalse(response.context["request"].user.is_authenticated)
+        self.assertFormError(response.context["form"], "verification_code", 'This field is required.')
+
     # login + webauthn
+
+    def test_webauthn_user_logged_in(self):
+        self.login()
+        response = self.client.get(reverse("accounts:verify_webauthn"))
+        self.assertRedirects(response, reverse("accounts:profile"))
+
+    def test_webauthn_no_token(self):
+        response = self.client.get(reverse("accounts:verify_webauthn"))
+        self.assertRedirects(response, reverse("login"))
 
     def test_login_webauthn_not_ok(self):
         UserWebAuthn.objects.create(
@@ -170,7 +224,7 @@ class AccountUsersViewsTestCase(TestCase):
         for text in (self.user.username, self.user.email,
                      self.remote_user.username, self.remote_user.email,
                      self.superuser.username, self.superuser.email,
-                     "4 Users"):
+                     "Users (4)"):
             self.assertContains(response, text)
         for text in (reverse("accounts:delete_user", args=(self.user.pk,)),
                      reverse("accounts:update_user", args=(self.user.pk,)),
@@ -201,6 +255,22 @@ class AccountUsersViewsTestCase(TestCase):
         self.assertNotContains(response, self.user.username)
         self.assertContains(response, self.ui_user.username)
 
+    def test_update_profile_login_redirect(self):
+        self.login_redirect("update_profile")
+
+    def test_update_profile_get(self):
+        self.login()
+        response = self.client.get(reverse("accounts:update_profile"))
+        self.assertTemplateUsed(response, "accounts/profile_form.html")
+
+    def test_update_profile_post(self):
+        self.login()
+        self.assertEqual(self.ui_user.items_per_page, 10)
+        response = self.client.post(reverse("accounts:update_profile"), {"items_per_page": 42}, follow=True)
+        self.assertTemplateUsed(response, "accounts/profile.html")
+        self.ui_user.refresh_from_db()
+        self.assertEqual(self.ui_user.items_per_page, 42)
+
     # invite
 
     def test_user_invite_login_redirect(self):
@@ -221,7 +291,7 @@ class AccountUsersViewsTestCase(TestCase):
                                     {"username": self.user.username,
                                      "email": "test@example.com"},
                                     follow=True)
-        self.assertFormError(response, "form", "username", "A user with that username already exists.")
+        self.assertFormError(response.context["form"], "username", "A user with that username already exists.")
 
     def test_user_invite_email_error(self):
         self.login("accounts.add_user")
@@ -229,7 +299,7 @@ class AccountUsersViewsTestCase(TestCase):
                                     {"username": "test",
                                      "email": self.user.email},
                                     follow=True)
-        self.assertFormError(response, "form", "email", "User with this Email already exists.")
+        self.assertFormError(response.context["form"], "email", "User with this Email already exists.")
 
     def test_user_invite_email_not_allowed(self):
         self.login("accounts.add_user", "accounts.view_user")
@@ -239,7 +309,7 @@ class AccountUsersViewsTestCase(TestCase):
                                      "email": "test@example.com"},
                                     follow=True)
         del settings._collection["users"]
-        self.assertFormError(response, "form", "email", "Email domain not allowed.")
+        self.assertFormError(response.context["form"], "email", "Email domain not allowed.")
 
     def test_user_invite_any_ok(self):
         self.login("accounts.add_user", "accounts.view_user")
@@ -247,7 +317,11 @@ class AccountUsersViewsTestCase(TestCase):
                                     {"username": "test",
                                      "email": "test@example.com"},
                                     follow=True)
-        for text in ("5 Users", "test", "test@example.com"):
+        self.assertEqual(len(mail.outbox), 1)
+        email = mail.outbox[0]
+        self.assertEqual(email.subject, "Invitation to Zentral")
+        self.assertIn("Your username: test", email.body)
+        for text in ("Users (5)", "test", "test@example.com"):
             self.assertContains(response, text)
 
     def test_user_invite_allowed_ok(self):
@@ -258,7 +332,7 @@ class AccountUsersViewsTestCase(TestCase):
                                      "email": "test@example.com"},
                                     follow=True)
         del settings._collection["users"]
-        for text in ("5 Users", "test", "test@example.com"):
+        for text in ("Users (5)", "test", "test@example.com"):
             self.assertContains(response, text)
         user = User.objects.get(email="test@example.com")
         self.assertEqual(user.description, "")
@@ -363,7 +437,7 @@ class AccountUsersViewsTestCase(TestCase):
                                     {"username": self.superuser.username,
                                      "email": self.user.email,
                                      "is_superuser": self.user.is_superuser})
-        self.assertFormError(response, "form", "username", "A user with that username already exists.")
+        self.assertFormError(response.context["form"], "username", "A user with that username already exists.")
 
     def test_user_update_email_error(self):
         self.login("accounts.change_user")
@@ -371,13 +445,14 @@ class AccountUsersViewsTestCase(TestCase):
                                     {"username": self.user.username,
                                      "email": self.superuser.email,
                                      "is_superuser": self.user.is_superuser})
-        self.assertFormError(response, "form", "email", "User with this Email already exists.")
+        self.assertFormError(response.context["form"], "email", "User with this Email already exists.")
 
     def test_user_update_ok(self):
         self.login("accounts.change_user", "accounts.view_user")
         response = self.client.post(reverse("accounts:update_user", args=(self.user.id,)),
                                     {"username": "toto",
                                      "email": "tata@example.com",
+                                     "items_per_page": 10,
                                      "is_superuser": self.user.is_superuser},
                                     follow=True)
         self.assertTemplateUsed(response, "accounts/user_detail.html")
@@ -424,7 +499,7 @@ class AccountUsersViewsTestCase(TestCase):
                                     follow=True)
         self.assertContains(response, "User {} deleted".format(user_str))
         self.assertTemplateUsed(response, "accounts/user_list.html")
-        self.assertContains(response, "3 User")
+        self.assertContains(response, "Users (3)")
 
     # create API token
 
@@ -450,13 +525,13 @@ class AccountUsersViewsTestCase(TestCase):
         self.assertEqual(response.status_code, 403)
 
     def test_self_create_api_token(self):
-        self.login()
+        self.login("accounts.view_user")
         response = self.client.post(reverse("accounts:create_user_api_token", args=(self.ui_user.id,)))
         self.assertTemplateUsed(response, "accounts/user_api_token.html")
         user = response.context["object"]
         self.assertEqual(user, self.ui_user)
         self.assertContains(response, "Settings")
-        self.assertNotContains(response, "Users")
+        self.assertContains(response, "Users")
         api_key = response.context["api_key"]
         self.assertContains(response, api_key)
         self.assertEqual(APIToken.objects._hash_key(api_key), self.ui_user.api_token.hashed_key)
@@ -542,7 +617,7 @@ class AccountUsersViewsTestCase(TestCase):
                                      "secret": form.initial_secret,
                                      "verification_code": "AAAAAA"})
         self.assertTemplateUsed(response, "accounts/add_totp.html")
-        self.assertFormError(response, "form", "verification_code", "Wrong verification code")
+        self.assertFormError(response.context["form"], "verification_code", "Wrong verification code")
         new_form = response.context["form"]
         self.assertEqual(form.initial_secret, new_form.initial_secret)
 
@@ -724,3 +799,132 @@ class AccountUsersViewsTestCase(TestCase):
         self.assertTemplateUsed(response, "accounts/user_verification_devices.html")
         self.assertEqual(UserWebAuthn.objects.filter(pk=user_webauthn.pk).count(), 0)
         self.assertNotContains(response, user_webauthn.name)
+
+    # password reset
+
+    def test_password_reset_get(self):
+        response = self.client.get(reverse("password_reset"))
+        self.assertTemplateUsed(response, "registration/password_reset_form.html")
+
+    def test_password_reset_post(self):
+        self.assertEqual(len(mail.outbox), 0)
+        response = self.client.post(reverse("password_reset"), {"email": self.ui_user.email}, follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "registration/password_reset_done.html")
+        self.assertEqual(len(mail.outbox), 1)
+        email = mail.outbox[0]
+        self.assertEqual(email.subject, "Password reset for Zentral")
+        self.assertIn(f"Your username, just in case: {self.ui_user.username}", email.body)
+
+    # password change
+
+    def test_password_change_get(self):
+        self.login()
+        response = self.client.get(reverse("password_change"))
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "registration/password_change_form.html")
+
+    def test_password_change_default_password_policy_1(self):
+        self.login()
+        response = self.client.post(reverse("password_change"),
+                                    {"old_password": self.ui_user_pwd,
+                                     "new_password1": "123",
+                                     "new_password2": "123"},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "registration/password_change_form.html")
+        self.assertFormError(response.context["form"], "new_password2",
+                             ["This password is too short. It must contain at least 8 characters.",
+                              "This password is too common.",
+                              "This password is entirely numeric."])
+
+    def test_password_change_default_password_policy_2(self):
+        self.login()
+        response = self.client.post(reverse("password_change"),
+                                    {"old_password": self.ui_user_pwd,
+                                     "new_password1": self.ui_user.username,
+                                     "new_password2": self.ui_user.username},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "registration/password_change_form.html")
+        self.assertFormError(response.context["form"], "new_password2",
+                             ["The password is too similar to the username."])
+
+    def test_password_change_default_password_policy_no_change(self):
+        self.login()
+        self.assertEqual(self.ui_user.userpasswordhistory_set.count(), 0)
+        response = self.client.post(reverse("password_change"),
+                                    {"old_password": self.ui_user_pwd,
+                                     "new_password1": self.ui_user_pwd,
+                                     "new_password2": self.ui_user_pwd},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "registration/password_change_form.html")
+        self.assertFormError(response.context["form"], "new_password2",
+                             ["Please, pick a new password."])
+
+    def test_password_change_default_password_policy_password_already_used(self):
+        new_password = get_random_string(12)
+        self.ui_user.set_password(new_password)
+        self.ui_user.save()
+        self.login()
+        self.assertEqual(self.ui_user.userpasswordhistory_set.count(), 1)
+        response = self.client.post(reverse("password_change"),
+                                    {"old_password": new_password,
+                                     "new_password1": self.ui_user_pwd,
+                                     "new_password2": self.ui_user_pwd},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "registration/password_change_form.html")
+        self.assertFormError(response.context["form"], "new_password2",
+                             ["You have already used that password, try another."])
+
+    def test_password_change_post(self):
+        self.login()
+        response = self.client.post(reverse("password_change"),
+                                    {"old_password": self.ui_user_pwd,
+                                     "new_password1": "lskdjlkd1",
+                                     "new_password2": "lskdjlkd1"},
+                                    follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, "registration/password_change_done.html")
+
+    # PasswordNotAlreadyUsedValidator
+
+    def test_password_not_already_used_help_text_default(self):
+        v = PasswordNotAlreadyUsedValidator()
+        self.assertEqual(v.get_help_text(), "Your password must not have been used before.")
+
+    def test_password_not_already_used_help_text_min(self):
+        v = PasswordNotAlreadyUsedValidator(min_unique_passwords=10)
+        self.assertEqual(
+            v.get_help_text(),
+            "Your password must be different than the last 10 passwords."
+        )
+
+    def test_password_not_already_used_min_unique_passwords(self):
+        for i in range(3):
+            self.ui_user.set_password(get_random_string(12))
+            self.ui_user.save()
+            self.ui_user.refresh_from_db()
+        v = PasswordNotAlreadyUsedValidator(min_unique_passwords=3)
+        self.assertIsNone(v.validate(self.ui_user_pwd))
+        self.assertIsNone(v.validate(self.ui_user_pwd, self.ui_user))
+        v = PasswordNotAlreadyUsedValidator(min_unique_passwords=4)
+        with self.assertRaises(ValidationError) as cm:
+            v.validate(self.ui_user_pwd, self.ui_user)
+        self.assertEqual(
+            cm.exception.args,
+            ('You have already used that password, try another.',
+             'password_already_used',
+             {'min_unique_passwords': 4})
+        )
+        v = PasswordNotAlreadyUsedValidator()
+        with self.assertRaises(ValidationError) as cm:
+            v.validate(self.ui_user_pwd, self.ui_user)
+        self.assertEqual(
+            cm.exception.args,
+            ('You have already used that password, try another.',
+             'password_already_used',
+             {'min_unique_passwords': None})
+        )

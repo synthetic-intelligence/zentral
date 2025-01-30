@@ -1,0 +1,22 @@
+{% extends 'base.html' %}
+
+{% block content %}
+<ol class="breadcrumb">
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'mdm:index' %}">MDM</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'mdm:enrolled_devices' %}">Devices</a></li>
+  <li class="breadcrumb-item"><a href="{{ object.get_absolute_url }}">{{ object }}</a></li>
+  <li class="breadcrumb-item active">Unblock</li>
+</ol>
+
+
+<h3>Unblock device {{ object }}</h3>
+
+<form method="post">{% csrf_token %}
+  <p>Do you really want to unblock this device?</p>
+  <p>
+    <a href="{{ object.get_absolute_url }}" class="btn btn-outline-secondary">Cancel</a>
+    <button type="submit" class="btn btn-success">Yes</button>
+  </p>
+</form>
+{% endblock %}

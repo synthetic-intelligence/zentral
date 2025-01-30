@@ -1,0 +1,93 @@
+{% extends 'base.html' %}
+{% load ui_extras %}
+
+{% block content %}
+<ol class="breadcrumb">
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'mdm:index' %}">MDM</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'mdm:filevault_configs' %}">FileVault configurations</a></li>
+  <li class="breadcrumb-item active">{{ object }}</li>
+</ol>
+
+
+<div class="object-details">
+    <div class="d-flex align-items-center mb-1">
+        <h2 class="m-0">{{ object }}</h2>
+    </div>
+    <div class="d-flex align-items-center mb-3">
+        <h3 class="m-0 fs-5 text-secondary">FileVault Configuration</h3>
+        <div class="ms-auto">
+            {% if perms.mdm.change_filevaultconfig %}
+                {% url 'mdm:update_filevault_config' object.pk as url %}
+                {% button 'UPDATE' url "Edit FileVault Config" %}
+            {% endif %}
+            {% if perms.mdm.delete_filevaultconfig and object.can_be_deleted %}
+                {% url 'mdm:delete_filevault_config' object.pk as url %}
+                {% button 'DELETE' url "Delete Filevault Configuration" %}
+            {% endif %}
+        </div>
+    </div>
+
+    <table class="table-object-properties">
+    <tbody>
+        <tr>
+        <th width="240px">Name</th>
+        <td>{{ object.name }}</th>
+        </tr>
+        <tr>
+        <th>Escrow location display name</th>
+        <td>{{ object.escrow_location_display_name }}</td>
+        </tr>
+        <tr>
+        <th>Defer enablement at login only?</th>
+        <td>{{ object.at_login_only|yesno }}</td>
+        </tr>
+        {% if object.at_login_only %}
+        <tr>
+        <th>Max bypass attempts at login</th>
+        <td>{{ object.bypass_attempts }}</td>
+        </tr>
+        {% endif %}
+        <tr>
+        <th>Show PRK?</th>
+        <td>{{ object.show_recovery_key|yesno }}</td>
+        </tr>
+        <tr>
+        <th>Destroy key on standby?</th>
+        <td>{{ object.destroy_key_on_standby|yesno }}</td>
+        </tr>
+        <tr>
+        <th>Automatic PRK rotation</th>
+        <td>
+            {% if not object.prk_rotation_interval_days %}
+            never
+            {% else %}
+            every {{ object.prk_rotation_interval_days }} day{{ object.prk_rotation_interval_days|pluralize }}
+            {% endif %}
+        </td>
+        </tr>
+        <tr>
+        <th>Blueprint{{ blueprint_count|pluralize }} ({{ blueprint_count }})</th>
+        <td>
+            {% if blueprint_count %}
+            <ul class="list-unstyled">
+            {% for blueprint in blueprints %}
+            {% if perms.mdm.view_blueprint %}
+            <li><a href="{{ blueprint.get_absolute_url }}">{{ blueprint }}</a></li>
+            {% else %}
+            <li>{{ blueprint }}</li>
+            {% endif %}
+            {% endfor %}
+            </ul>
+            {% else %}
+            -
+            {% endif %}
+        </td>
+    </tbody>
+    </table>
+
+    {% created_updated_at object %}
+
+</div>
+
+{% endblock %}

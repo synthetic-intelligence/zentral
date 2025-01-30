@@ -1,0 +1,58 @@
+{% extends 'base.html' %}
+{% load ui_extras %}
+
+{% block content %}
+<ol class="breadcrumb">
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'intune:index' %}">Microsoft Intune Inventory</a></li>
+  <li class="breadcrumb-item active">Tenant{{ tenant_count|pluralize }}</li>
+</ol>
+
+<div class="d-flex justify-content-between mb-3">
+    <h2 class="m-0">Microsoft Intune Inventory Tenant{{ tenant_count|pluralize }} ({{ tenant_count }})</h2>
+    <div class="ms-auto">
+        {% if perms.intune.add_tenant %}
+            {% url 'intune:create_tenant' as url %}
+            {% button 'CREATE' url "Add new Tenant" %}
+        {% endif %}
+    </div>
+</div>
+
+{% if object_list %}
+<table class="table table-striped align-middle table-hover">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Description</th>
+      <th>Business unit</th>
+      {% if perms.intune.change_tenant %}
+      <th></th>
+      {% endif %}
+    </tr>
+  </thead>
+  <tbody>
+    {% for tenant in object_list %}
+    <tr class="data-row">
+      <td><a href="{{ tenant.get_absolute_url }}">{{ tenant.name }}</a></td>
+      <td>{{ tenant.description }}</td>
+      <td>{{ tenant.business_unit }}</td>
+      {% if perms.intune.change_tenant %}
+      <td class="text-end py-0">
+        {% url 'intune:update_tenant' tenant.pk as url %}
+        {% button 'UPDATE' url "Edit Tenant" %}
+      </td>
+      {% endif %}
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+    {% if perms.wsone.add_instance %}
+        {% url 'intune:create_tenant' as link %}
+        {% no_entities 'Tenants' link %}
+    {% else %}
+        {% no_entities 'Tenants' %}
+    {% endif %}
+{% endif %}
+{% endblock %}
+

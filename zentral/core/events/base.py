@@ -1,4 +1,5 @@
 from datetime import datetime
+from enum import Enum
 import logging
 import os.path
 import re
@@ -65,7 +66,7 @@ class EventObserver(object):
         if self.content_type and self.pk:
             try:
                 app_label, model = self.content_type.split(".")
-                ct = ContentType.objects.get(app_label=app_label, model=model)
+                ct = ContentType.objects.get_by_natural_key(app_label, model)
                 return ct.get_object_for_this_type(pk=self.pk)
             except ObjectDoesNotExist:
                 pass
@@ -106,10 +107,10 @@ class EventRequestUser(object):
                 if ras and ras.is_remote:
                     session_d.update({
                         "is_remote": True,
-                        "realm_authentication_session_pk": ras.pk,
-                        "realm_user_pk": ras.user.pk,
+                        "realm_authentication_session_pk": str(ras.pk),
+                        "realm_user_pk": str(ras.user.pk),
                         "realm": {
-                            "pk": ras.realm.pk,
+                            "pk": str(ras.realm.pk),
                             "name": ras.realm.name
                         }
                     })
@@ -164,6 +165,33 @@ class EventRequestGeo(object):
         if kwargs:
             return cls(**kwargs)
 
+    @classmethod
+    def build_from_request(cls, request):
+        kwargs = {}
+        for header, attr, sub_attr, attr_type in (
+            ("HTTP_CF_IPCITY", "city_name", None, None),
+            ("HTTP_CF_IPCONTINENT", "continent_name", None, None),
+            ("HTTP_CF_IPCOUNTRY", "country_iso_code", None, None),
+            ("HTTP_CF_IPLATITUDE", "location", "lat", float),
+            ("HTTP_CF_IPLONGITUDE", "location", "lon", float),
+            ("HTTP_CF_REGION", "region_name", None, None)
+        ):
+            val = request.META.get(header)
+            if not val:
+                continue
+            if attr_type:
+                try:
+                    val = attr_type(val)
+                except ValueError:
+                    continue
+            d = kwargs
+            if sub_attr:
+                d = d.setdefault(attr, {})
+                attr = sub_attr
+            d[attr] = val
+        if kwargs:
+            return cls(**kwargs)
+
     def serialize(self):
         d = {}
         for attr in self.geo_attr_list:
@@ -179,22 +207,30 @@ class EventRequestGeo(object):
 class EventRequest(object):
     user_agent_str_length = 50
 
-    def __init__(self, user_agent, ip, user=None, geo=None):
+    def __init__(self, user_agent, ip, user=None, geo=None, method=None, path=None):
         self.user_agent = user_agent
         self.ip = ip
         self.geo = geo
         self.user = user
+        self.method = method
+        self.path = path
 
     @classmethod
     def build_from_request(cls, request):
         user_agent, ip = user_agent_and_ip_address_from_request(request)
+        method = request.method
+        path = request.get_full_path()
         user = EventRequestUser.build_from_request(request)
-        if user_agent or ip or user:
-            return EventRequest(user_agent, ip, user=user)
+        geo = EventRequestGeo.build_from_request(request)
+        return EventRequest(
+            user_agent, ip,
+            method=method, path=path,
+            user=user, geo=geo,
+        )
 
     @classmethod
     def deserialize(cls, request_d):
-        kwargs = {k: request_d.get(k) for k in ("user_agent", "ip")}
+        kwargs = {k: request_d.get(k) for k in ("user_agent", "ip", "method", "path")}
         geo_d = request_d.get("geo")
         if geo_d:
             kwargs["geo"] = EventRequestGeo(**geo_d)
@@ -205,7 +241,9 @@ class EventRequest(object):
 
     def serialize(self):
         d = {k: v for k, v in (("user_agent", self.user_agent),
-                               ("ip", self.ip)) if v}
+                               ("ip", self.ip),
+                               ("method", self.method),
+                               ("path", self.path)) if v}
         if self.geo:
             d["geo"] = self.geo.serialize()
         if self.user:
@@ -476,6 +514,66 @@ class BaseEvent(object):
 
 
 register_event_type(BaseEvent)
+
+
+# Zentral audit event
+
+
+class AuditEvent(BaseEvent):
+
+    class Action(Enum):
+        CREATED = "created"
+        UPDATED = "updated"
+        DELETED = "deleted"
+
+    event_type = "zentral_audit"
+    tags = ["zentral"]
+
+    @classmethod
+    def build(
+        cls,
+        instance, action, prev_value=None,
+        event_uuid=None, event_index=None,
+        event_request=None
+    ):
+        em_kwargs = {"tags": [instance._meta.app_label]}
+        if event_uuid is not None:
+            em_kwargs["uuid"] = event_uuid
+        if event_index is not None:
+            em_kwargs["index"] = event_index
+        if event_request:
+            em_kwargs["request"] = event_request
+        metadata = EventMetadata(**em_kwargs)
+        try:
+            metadata.add_objects(instance.linked_objects_keys_for_event())
+        except AttributeError:
+            key = instance._meta.verbose_name.replace(" ", "_")
+            if instance._meta.app_label != "inventory":  # shorter names for the inventory objects
+                key = f"{instance._meta.app_label}_{key}"
+            metadata.add_objects({key: ((instance.pk,),)})
+        # payload
+        payload = {
+            "action": action.value,
+            "object": {
+                "model": instance._meta.label_lower,
+                "pk": str(instance.pk),
+            }
+        }
+        if prev_value:
+            payload["object"]["prev_value"] = prev_value
+        if action in (cls.Action.CREATED, cls.Action.UPDATED):
+            payload["object"]["new_value"] = instance.serialize_for_event()
+        return cls(metadata, payload)
+
+    @classmethod
+    def build_from_request_and_instance(cls, request, instance, action, prev_value=None):
+        event_request = EventRequest.build_from_request(request)
+        return cls.build(
+            instance, action, prev_value, event_request=event_request
+        )
+
+
+register_event_type(AuditEvent)
 
 
 # Zentral Commands

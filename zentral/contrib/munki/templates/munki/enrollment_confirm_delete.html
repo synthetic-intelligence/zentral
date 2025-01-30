@@ -1,12 +1,11 @@
 {% extends 'base.html' %}
-{% load bootstrap inventory_extras %}
 
 {% block content %}
 <ol class="breadcrumb">
-  <li><a href="/">Home</a></li>
-  <li><a href="{% url 'munki:configurations' %}">Munki configurations</a></li>
-  <li><a href="{{ enrollment.configuration.get_absolute_url }}">{{ enrollment.configuration }}</a></li>
-  <li class="active">Delete enrollment</li>
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'munki:configurations' %}">Munki configurations</a></li>
+  <li class="breadcrumb-item"><a href="{{ enrollment.configuration.get_absolute_url }}">{{ enrollment.configuration }}</a></li>
+  <li class="breadcrumb-item active">Delete enrollment</li>
 </ol>
 
 <h2>Delete enrollment</h2>
@@ -18,7 +17,7 @@
   <p>Please ensure you do not re-use any packages previously associated with this specific enrollment.</p>
   {% endif %}
   <p>
-    <a class="btn btn-default" href="{{ object.get_absolute_url }}">Cancel</a>
+    <a class="btn btn-outline-secondary" href="{{ object.get_absolute_url }}">Cancel</a>
     <button class="btn btn-danger" type="submit">Delete</button>
   </p>
 </form>

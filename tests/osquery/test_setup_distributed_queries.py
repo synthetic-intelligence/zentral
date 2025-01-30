@@ -318,6 +318,10 @@ class OsquerySetupDistributedQueriesViewsTestCase(TestCase):
                 serial_number=serial_numbers[i],
                 status=3,
                 error_message=err_msgs[i],
+                memory=111111111111,
+                system_time=222222222222,
+                user_time=333333333333,
+                wall_time_ms=444444444444,
             ) for i in range(dqm_count)
         )
         DistributedQueryMachine.objects.bulk_create(dqm_gen)
@@ -325,10 +329,14 @@ class OsquerySetupDistributedQueriesViewsTestCase(TestCase):
         response = self.client.get(reverse("osquery:distributed_query_machines", args=(distributed_query.pk,)))
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "osquery/distributedquerymachine_list.html")
-        self.assertContains(response, f"{dqm_count} Machines")
+        self.assertContains(response, f"Machines ({dqm_count})")
         self.assertContains(response, serial_numbers[-1])
         self.assertContains(response, "Error")
         self.assertContains(response, err_msgs[-1])
+        self.assertContains(response, "111111111111")
+        self.assertContains(response, "222222222222")
+        self.assertContains(response, "333333333333")
+        self.assertContains(response, "444444444444")
 
     # distributed query machines search
 
@@ -353,7 +361,7 @@ class OsquerySetupDistributedQueriesViewsTestCase(TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "osquery/distributedquerymachine_list.html")
-        self.assertContains(response, "1 Machine")
+        self.assertContains(response, "Machine (1)")
         self.assertContains(response, serial_search)
         for serial_number in serial_numbers[1:]:
             self.assertNotContains(response, serial_number)
@@ -378,7 +386,7 @@ class OsquerySetupDistributedQueriesViewsTestCase(TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "osquery/distributedquerymachine_list.html")
-        self.assertContains(response, "2 Machines")
+        self.assertContains(response, "Machines (2)")
         for serial_number in serial_numbers[1:]:
             self.assertContains(response, serial_number)
         self.assertContains(response, err_msgs[-1])
@@ -413,7 +421,7 @@ class OsquerySetupDistributedQueriesViewsTestCase(TestCase):
         response = self.client.get(reverse("osquery:distributed_query_results", args=(distributed_query.pk,)))
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "osquery/distributedqueryresult_list.html")
-        self.assertContains(response, f"{dqr_count} Results")
+        self.assertContains(response, f"Results ({dqr_count})")
         self.assertContains(response, serial_numbers[-1])
         self.assertContains(response, f"page 1 of {dqr_count}")
         search_term = serial_numbers[0] + get_random_string(12)
@@ -422,15 +430,15 @@ class OsquerySetupDistributedQueriesViewsTestCase(TestCase):
                              search_term)
         )
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, search_term)
-        self.assertContains(response, "0 Results")
+        # self.assertContains(response, search_term)
+        self.assertContains(response, "No results for this run")
         search_term = serial_numbers[0]
         response = self.client.get(
             "{}?q={}".format(reverse("osquery:distributed_query_results", args=(distributed_query.pk,)),
                              search_term)
         )
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "1 Result")
+        self.assertContains(response, "Result (1)")
 
     # distributed query file carving sessions
 
@@ -469,7 +477,7 @@ class OsquerySetupDistributedQueriesViewsTestCase(TestCase):
                                            args=(distributed_query.pk,)))
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "osquery/dq_filecarvingsession_list.html")
-        self.assertContains(response, f"{fcs_count} File carving sessions")
+        self.assertContains(response, f"File carving sessions ({fcs_count})")
         self.assertContains(response, serial_numbers[-1])
         self.assertContains(response, "0/17")
         self.assertContains(response, f"page 1 of {fcs_count}")

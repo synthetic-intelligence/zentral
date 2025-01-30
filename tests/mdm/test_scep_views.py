@@ -31,10 +31,12 @@ class SCEPViewsTestCase(TestCase):
                 serial_number = session.enrollment_secret.serial_numbers[0]
             else:
                 serial_number = get_random_string(12)
-        privkey = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=512
-        )  # lgtm[py/weak-crypto-key]
+        with patch('cryptography.hazmat.primitives.asymmetric.rsa._verify_rsa_parameters') as _verify_rsa_parameters:
+            _verify_rsa_parameters.return_value = True
+            privkey = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=512
+            )  # lgtm[py/weak-crypto-key]
         if session:
             cn = session.get_common_name()
             org = session.get_organization()
@@ -49,12 +51,12 @@ class SCEPViewsTestCase(TestCase):
         kwargs = {"data": {"csr": csr_pem},
                   "content_type": "application/json",
                   "HTTP_ZENTRAL_API_SECRET": make_secret("zentral")}
-        return self.client.post(reverse("mdm:verify_scep_csr"), **kwargs)
+        return self.client.post(reverse("mdm_public:verify_scep_csr"), **kwargs)
 
     # tests
 
     def test_permission_denied(self, post_event):
-        response = self.client.post(reverse("mdm:verify_scep_csr"))
+        response = self.client.post(reverse("mdm_public:verify_scep_csr"))
         self.assertEqual(response.status_code, 403)
 
     def test_dep_enrollment_session_ok(self, post_event):

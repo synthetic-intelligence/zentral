@@ -1,0 +1,100 @@
+{% extends 'base.html' %}
+{% load inventory_extras %}
+
+{% block content %}
+<ol class="breadcrumb">
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item"><a href="{%  url 'monolith:index' %}">Monolith</a></li>
+  <li class="breadcrumb-item"><a href="{%  url 'monolith:pkg_infos' %}">PkgInfos</a></li>
+  {% if object %}
+  <li class="breadcrumb-item"><a href="{{ object.get_absolute_url }}">{{ object.name }}</a></li>
+  <li class="breadcrumb-item active">Update version {{ object.version }}</li>
+  {% else %}
+  {% if pkg_info_name %}
+  <li class="breadcrumb-item"><a href="{{ pkg_info_name.get_absolute_url }}">{{ pkg_info_name }}</a></li>
+  {% endif %}
+  <li class="breadcrumb-item active">Upload package</li>
+  {% endif %}
+</ol>
+
+<h2>{% if object %}Update{% else %}Upload{% endif %} package</h2>
+
+<form class="update-form", method="POST" enctype="multipart/form-data">{% csrf_token %}
+  {% if object %}
+  <div class="form-group">
+    <label class="control-label">File</label>
+    <div>{{ object.data.installer_item_location|default:"-" }}</div>
+  </div>
+  {% endif %}
+
+  {{ form }}
+
+  <div class="form-group my-3">
+    <label class="control-label fw-bold">Tag shards</label>
+    <div>
+      <select id="add-tag-shard-sel">
+        {% for tag, active, shard in form.tag_shards %}
+        <option id="add-tag-shard-opt-{{ tag.pk }}" value="{{ tag.pk }}"{% if active %} disabled{% endif %}>{{ tag.name  }}</option>
+        {% endfor %}
+      </select>
+      <button id="add-tag-shard" data-tag-pk="{{ tag.pk }}" type="button" class="btn btn-primary btn-xs">
+        Add
+      </button>
+    </div>
+    <table>
+      {% for tag, active, shard in form.tag_shards %}
+      <tr id="tag-shard-{{ tag.pk }}"{% if not active %} style="display:none;"{% endif %}>
+        <td>{% inventory_tag tag %}</td>
+        <td style="padding:5px">
+          <input type="number" class="form-control hide-if-not-install" name="tag-shard-{{ tag.pk }}" value="{{ shard }}" min="0", max="1000"{% if not active %} disabled{% endif %}>
+        </td>
+        <td>
+          <button type="button" data-tag-pk="{{ tag.pk }}" class="btn btn-danger del-tag-shard">
+            <i class="bi bi-trash" aria-hidden="true"></i>
+          </button>
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+  <p>
+    {% if object %}
+    <a class="btn btn-outline-secondary" href="{{ object.get_absolute_url }}">Cancel</a>
+    {% else %}
+    {% if pkg_info_name %}
+    <a class="btn btn-outline-secondary" href="{{ pkg_info_name.get_absolute_url }}">Cancel</a>
+    {% else %}
+    <a class="btn btn-outline-secondary" href="{% url 'monolith:pkg_infos' %}">Cancel</a>
+    {% endif %}
+    {% endif %}
+    <button class="btn btn-primary" type="submit">Save</button>
+  </p>
+</form>
+{% endblock %}
+
+{% block extrajs %}
+<script nonce="{{ request.csp_nonce }}">
+  $(document).ready(function () {
+    $("#add-tag-shard").click(function(event){
+      event.preventDefault();
+      var tagId = parseInt($("#add-tag-shard-sel").val(), 10);
+      $("#tag-shard-" + tagId).show();
+      var inputElm = $('input[name="tag-shard-' + tagId + '"]');
+      inputElm.prop("disabled", false)
+      var shardModulo = parseInt($('input[name="shard_modulo"]').val(), 10);
+      if (!isNaN(shardModulo)) {
+          inputElm.val(shardModulo);
+      }
+      $("#add-tag-shard-opt-" + tagId).prop("disabled", true);
+    });
+    $(".del-tag-shard").click(function(event){
+      event.preventDefault();
+      var btn = $(this);
+      var tagId = parseInt(btn.data("tag-pk"), 10);
+      $("#tag-shard-" + tagId).hide();
+      $('input[name="tag-shard-' + tagId + '"]').prop("disabled", true);
+      $("#add-tag-shard-opt-" + tagId).prop("disabled", false);
+    });
+  });
+</script>
+{% endblock %}

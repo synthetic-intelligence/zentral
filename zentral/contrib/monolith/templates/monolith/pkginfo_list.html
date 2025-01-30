@@ -1,0 +1,135 @@
+{% extends 'base.html' %}
+{% load inventory_extras ui_extras %}
+
+{% block content %}
+<ol class="breadcrumb">
+  <li class="breadcrumb-item"><a href="/">Home</a></li>
+  <li class="breadcrumb-item"><a href="{% url 'monolith:index' %}">Monolith</a></li>
+  {% for url, anchor_text in breadcrumbs %}
+  {% if url %}
+  <li class="breadcrumb-item"><a href="{{ url }}">{{ anchor_text }}</a></li>
+  {% else %}
+  <li class="breadcrumb-item active">{{ anchor_text }}</li>
+  {% endif %}
+  {% endfor %}
+</ol>
+
+<div class="d-flex align-items-center mb-1">
+    <h2>Package name{{ name_number|pluralize }} ({{ name_number }}) / Package{{ info_number|pluralize }} ({{ info_number }})</h2>
+</div>
+
+<div class="d-flex flex-wrap align-items-center mb-1">
+    <form method="GET" class="search-form">
+
+        {{ form }}
+
+        <button type="submit" class="btn btn-link mb-2">
+            <i class="bi bi-search"></i>
+        </button>
+    </form>
+    <div class="ms-auto">
+        {% if perms.add_pkginfoname or perms.add_pkginfo %}
+        <div class="dropdown">
+            <button class="btn btn-link dropdown-toggle" type="button" id="pkgInfoAdd"
+                    data-bs-toggle="dropdown" aria-haspopup="true" aria-expanded="true">
+                <i class="bi bi-plus-circle"></i>
+            </button>
+            <ul class="dropdown-menu" aria-labelledby="pkgInfoAdd">
+            {% if perms.add_pkginfoname %}
+                <li><a class="dropdown-item" href="{% url 'monolith:create_pkg_info_name' %}">Package info name</a></li>
+            {% endif %}
+            {% if perms.add_pkginfo %}
+                <li><a class="dropdown-item" href="{% url 'monolith:upload_package' %}">Package</a></li>
+            {% endif %}
+            </ul>
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+{% if pkg_names %}
+<table class="table table-striped align-middle">
+  <thead>
+    <th>Package</th>
+    <th>Catalogs</th>
+    <th>Excl. tags</th>
+    <th>Def. shard</th>
+    <th>Tag shards</th>
+    <th>Installs</th>
+    {% if perms.monolith.delete_pkginfo or perms.monolith.change_pkginfo %}
+    <th></th>
+    {% endif %}
+  </thead>
+  <tbody>
+  {% for pkg_info_name in pkg_names %}
+  <tr>
+    <td colspan="5"><a href="{% url 'monolith:pkg_info' pkg_info_name.id %}">{{ pkg_info_name.name }}</a></td>
+    <td>{{ pkg_info_name.count }}</td>
+    {% if perms.monolith.delete_pkginfo or perms.monolith.change_pkginfo %}
+    <td></td>
+    {% endif %}
+  </tr>
+  {% for pkg_info in pkg_info_name.pkg_infos %}
+  <tr>
+    <td width="25%">{{ pkg_info.version }}</td>
+    <td>
+      {% for catalog in pkg_info.catalogs %}{% if perms.monolith.view_catalog %}<a href="{% url 'monolith:catalog' catalog.pk %}">{{ catalog.name }}</a>{% else %}{{ catalog.name }}{% endif %}{% if not forloop.last %}, {% endif %}{% endfor %}
+    </td>
+    {% if pkg_info.options %}
+    <td>
+      {% for tag in pkg_info.options.excluded_tags %}
+      {% inventory_tag tag %}
+      {% empty %}
+      -
+      {% endfor %}
+    </td>
+    <td>
+      {{ pkg_info.options.shards.default }}/{{ pkg_info.options.shards.modulo }}
+    </td>
+    <td>
+      {% if pkg_info.options.shards.tags %}
+      <table>
+      {% for tag, shard in pkg_info.options.shards.tags %}
+      <tr><td style="padding:0 5px 2px 0">{% inventory_tag tag %}</td><td>{{ shard }}</td></tr>
+      {% endfor %}
+      </table>
+      {% else %}
+      -
+      {% endif %}
+    </td>
+    {% else %}
+    <td>-</td>
+    <td>-</td>
+    <td>-</td>
+    {% endif %}
+    <td>{{ pkg_info.count }}{% if pkg_info.percent %} - {{ pkg_info.percent|floatformat }}%{% endif %}</td>
+    {% if perms.monolith.delete_pkginfo or perms.monolith.change_pkginfo %}
+    <td>
+      {% if pkg_info.local %}
+      {% if perms.monolith.change_pkginfo %}
+      {% url 'monolith:update_package' pkg_info.pk as url %}
+      {% button 'UPDATE' url "Edit PkgInfo" %}
+      {% endif %}
+      {% if perms.monolith.delete_pkginfo %}
+      {% url 'monolith:delete_pkg_info' pkg_info.pk as url %}
+      {% button 'DELETE' url "Delete PkgInfo" %}
+      {% endif %}
+      {% else %}
+      {% if perms.monolith.change_pkginfo and pkg_info.local %}
+      {% url 'monolith:update_pkg_info_catalog' pkg_info.pk as url %}
+      {% button 'UPDATE' url "Change PkgInfo catalogs" %}
+      {% endif %}
+      {% endif %}
+    </td>
+    {% endif %}
+  </tr>
+  {% endfor %}
+  {% endfor %}
+  </tbody>
+</table>
+{% elif form.has_changed %}
+    {% url 'monolith:pkg_infos' as empty_results_url %}
+    {% empty_results empty_results_url %}
+{% endif %}
+
+{% endblock %}

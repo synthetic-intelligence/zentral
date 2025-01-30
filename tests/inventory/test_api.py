@@ -1,5 +1,6 @@
 from functools import reduce
 import operator
+from unittest.mock import patch
 from django.contrib.auth.models import Group, Permission
 from django.db.models import Q
 from django.urls import reverse
@@ -9,9 +10,12 @@ from rest_framework.test import APITestCase
 from accounts.models import APIToken, User
 from zentral.contrib.inventory.models import (CurrentMachineSnapshot, MachineSnapshot,
                                               MachineSnapshotCommit, MetaBusinessUnit, Tag, Taxonomy)
+from zentral.core.events.base import AuditEvent
 
 
 class InventoryAPITests(APITestCase):
+    maxDiff = None
+
     @classmethod
     def setUpTestData(cls):
         cls.user = User.objects.create_user(
@@ -326,15 +330,62 @@ class InventoryAPITests(APITestCase):
         response = self.client.post(reverse('inventory_api:meta_business_units'), data, format='json')
         self.assertEqual(response.status_code, 403)
 
-    def test_create_meta_business_unit(self):
-        data = {'name': 'TestMBU0'}
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_create_meta_business_unit(self, post_event):
+        name = get_random_string(12)
+        data = {'name': name}
         self._set_permissions("inventory.add_metabusinessunit")
-        response = self.client.post(reverse('inventory_api:meta_business_units'), data, format='json')
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            response = self.client.post(reverse('inventory_api:meta_business_units'), data, format='json')
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(MetaBusinessUnit.objects.filter(name='TestMBU0').count(), 1)
-        meta_business_unit = MetaBusinessUnit.objects.get(name='TestMBU0')
-        self.assertEqual(meta_business_unit.name, 'TestMBU0')
+        self.assertEqual(len(callbacks), 1)
+        mbus = list(MetaBusinessUnit.objects.filter(name=name))
+        self.assertEqual(len(mbus), 1)
+        meta_business_unit = mbus[0]
+        self.assertEqual(meta_business_unit.name, name)
         self.assertFalse(meta_business_unit.api_enrollment_enabled())
+        self.assertEqual(len(post_event.call_args_list), 1)
+        event = post_event.call_args_list[0].args[0]
+        self.assertIsInstance(event, AuditEvent)
+        self.assertEqual(
+            event.payload,
+            {"action": "created",
+             "object": {
+                 "model": "inventory.metabusinessunit",
+                 "pk": str(meta_business_unit.pk),
+                 "new_value": {
+                     "pk": meta_business_unit.pk,
+                     "name": name,
+                     "api_enrollment_enabled": False,
+                     "created_at": meta_business_unit.created_at,
+                     "updated_at": meta_business_unit.updated_at
+                 }
+              }}
+        )
+        metadata = event.metadata.serialize()
+        metadata["tags"].sort()
+        self.assertEqual(
+            metadata,
+            {'created_at': event.metadata.created_at.isoformat(),
+             'id': str(event.metadata.uuid),
+             'index': 0,
+             'namespace': 'zentral_audit',
+             'objects': {'meta_business_unit': [str(meta_business_unit.pk)]},
+             'request': {'ip': '127.0.0.1',
+                         'method': 'POST',
+                         'path': '/api/inventory/meta_business_units/',
+                         'user': {'email': self.user.email,
+                                  'id': self.user.pk,
+                                  'is_remote': False,
+                                  'is_service_account': False,
+                                  'is_superuser': False,
+                                  'session': {'is_remote': False,
+                                              'mfa_authenticated': False,
+                                              'token_authenticated': True},
+                                  'username': self.user.username}},
+             'tags': ['inventory', 'zentral'],
+             'type': 'zentral_audit'}
+        )
 
     def test_create_api_enabled_meta_business_unit(self):
         url = reverse('inventory_api:meta_business_units')
@@ -382,18 +433,72 @@ class InventoryAPITests(APITestCase):
         response = self.client.put(reverse('inventory_api:meta_business_unit', args=(meta_business_unit.pk,)))
         self.assertEqual(response.status_code, 403)
 
-    def test_update_meta_business_unit(self):
-        meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string(12))
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_update_meta_business_unit(self, post_event):
+        name = get_random_string(12)
+        meta_business_unit = MetaBusinessUnit.objects.create(name=name)
         self.assertFalse(meta_business_unit.api_enrollment_enabled())
         self._set_permissions("inventory.change_metabusinessunit")
         url = reverse('inventory_api:meta_business_unit', args=(meta_business_unit.pk,))
         updated_name = get_random_string(12)
         data = {'name': updated_name, 'api_enrollment_enabled': True}
-        response = self.client.put(url, data, format='json')
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            response = self.client.put(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(callbacks), 1)
+        prev_updated_at = meta_business_unit.updated_at
         meta_business_unit.refresh_from_db()
         self.assertEqual(meta_business_unit.name, updated_name)
         self.assertTrue(meta_business_unit.api_enrollment_enabled())
+        self.assertEqual(len(post_event.call_args_list), 1)
+        event = post_event.call_args_list[0].args[0]
+        self.assertIsInstance(event, AuditEvent)
+        self.assertEqual(
+            event.payload,
+            {"action": "updated",
+             "object": {
+                 "model": "inventory.metabusinessunit",
+                 "pk": str(meta_business_unit.pk),
+                 "new_value": {
+                     "pk": meta_business_unit.pk,
+                     "name": updated_name,
+                     "api_enrollment_enabled": True,
+                     "created_at": meta_business_unit.created_at,
+                     "updated_at": meta_business_unit.updated_at
+                 },
+                 "prev_value": {
+                     "pk": meta_business_unit.pk,
+                     "name": name,
+                     "api_enrollment_enabled": False,
+                     "created_at": meta_business_unit.created_at,
+                     "updated_at": prev_updated_at
+                 }
+              }}
+        )
+        metadata = event.metadata.serialize()
+        metadata["tags"].sort()
+        self.assertEqual(
+            metadata,
+            {'created_at': event.metadata.created_at.isoformat(),
+             'id': str(event.metadata.uuid),
+             'index': 0,
+             'namespace': 'zentral_audit',
+             'objects': {'meta_business_unit': [str(meta_business_unit.pk)]},
+             'request': {'ip': '127.0.0.1',
+                         'method': 'PUT',
+                         'path': f'/api/inventory/meta_business_units/{meta_business_unit.pk}/',
+                         'user': {'email': self.user.email,
+                                  'id': self.user.pk,
+                                  'is_remote': False,
+                                  'is_service_account': False,
+                                  'is_superuser': False,
+                                  'session': {'is_remote': False,
+                                              'mfa_authenticated': False,
+                                              'token_authenticated': True},
+                                  'username': self.user.username}},
+             'tags': ['inventory', 'zentral'],
+             'type': 'zentral_audit'}
+        )
 
     def test_update_meta_business_unit_disable_api_enrollment_error(self):
         meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string(12))
@@ -412,7 +517,7 @@ class InventoryAPITests(APITestCase):
     def test_update_meta_business_unit_name_error(self):
         name = get_random_string(12)
         MetaBusinessUnit.objects.create(name=name)
-        meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string())
+        meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string(12))
         self._set_permissions("inventory.change_metabusinessunit")
         url = reverse('inventory_api:meta_business_unit', args=(meta_business_unit.pk,))
         data = {'name': name, 'api_enrollment_enabled': False}
@@ -423,18 +528,64 @@ class InventoryAPITests(APITestCase):
     # delete meta business unit
 
     def test_delete_meta_business_unit_unauthorized(self):
-        meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string())
+        meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string(12))
         url = reverse('inventory_api:meta_business_unit', args=(meta_business_unit.pk,))
         response = self.client.delete(url)
         self.assertEqual(response.status_code, 403)
 
-    def test_delete_meta_business_unit(self):
-        meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string())
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_delete_meta_business_unit(self, post_event):
+        name = get_random_string(12)
+        meta_business_unit = MetaBusinessUnit.objects.create(name=name)
+        prev_pk = meta_business_unit.pk
         self._set_permissions("inventory.delete_metabusinessunit")
         url = reverse('inventory_api:meta_business_unit', args=(meta_business_unit.pk,))
-        response = self.client.delete(url)
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            response = self.client.delete(url)
         self.assertEqual(response.status_code, 204)
+        self.assertEqual(len(callbacks), 1)
         self.assertEqual(MetaBusinessUnit.objects.filter(pk=meta_business_unit.pk).count(), 0)
+        event = post_event.call_args_list[0].args[0]
+        self.assertIsInstance(event, AuditEvent)
+        self.assertEqual(
+            event.payload,
+            {"action": "deleted",
+             "object": {
+                 "model": "inventory.metabusinessunit",
+                 "pk": str(prev_pk),
+                 "prev_value": {
+                     "pk": prev_pk,
+                     "name": name,
+                     "api_enrollment_enabled": False,
+                     "created_at": meta_business_unit.created_at,
+                     "updated_at": meta_business_unit.updated_at
+                 }
+              }}
+        )
+        metadata = event.metadata.serialize()
+        metadata["tags"].sort()
+        self.assertEqual(
+            metadata,
+            {'created_at': event.metadata.created_at.isoformat(),
+             'id': str(event.metadata.uuid),
+             'index': 0,
+             'namespace': 'zentral_audit',
+             'objects': {'meta_business_unit': [str(meta_business_unit.pk)]},
+             'request': {'ip': '127.0.0.1',
+                         'method': 'DELETE',
+                         'path': f'/api/inventory/meta_business_units/{prev_pk}/',
+                         'user': {'email': self.user.email,
+                                  'id': self.user.pk,
+                                  'is_remote': False,
+                                  'is_service_account': False,
+                                  'is_superuser': False,
+                                  'session': {'is_remote': False,
+                                              'mfa_authenticated': False,
+                                              'token_authenticated': True},
+                                  'username': self.user.username}},
+             'tags': ['inventory', 'zentral'],
+             'type': 'zentral_audit'}
+        )
 
     # list meta business unit
 
@@ -462,24 +613,70 @@ class InventoryAPITests(APITestCase):
         response = self.client.post(reverse('inventory_api:tags'), data, format='json')
         self.assertEqual(response.status_code, 403)
 
-    def test_create_tag(self):
-        meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string(12))
-        data = {'meta_business_unit': meta_business_unit.pk, 'name': 'TestTag0', 'color': 'ff0000'}
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_create_tag(self, post_event):
+        mbu_name = get_random_string(12)
+        meta_business_unit = MetaBusinessUnit.objects.create(name=mbu_name)
+        name = get_random_string(12)
+        data = {'meta_business_unit': meta_business_unit.pk, 'name': name, 'color': 'ff0000'}
         self._set_permissions("inventory.add_tag")
-        response = self.client.post(reverse('inventory_api:tags'), data, format='json')
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            response = self.client.post(reverse('inventory_api:tags'), data, format='json')
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        tag = Tag.objects.get(name='TestTag0')
+        self.assertEqual(len(callbacks), 1)
+        tag = Tag.objects.get(name=name)
         self.assertEqual(tag.meta_business_unit, meta_business_unit)
-        self.assertEqual(tag.name, data["name"])
+        self.assertEqual(tag.name, name)
         self.assertEqual(tag.color, data["color"])
         self.assertEqual(
             response.data,
             {"id": tag.pk,
              "taxonomy": None,
              "meta_business_unit": meta_business_unit.pk,
-             "name": tag.name,
+             "name": name,
              "slug": tag.slug,
              "color": tag.color}
+        )
+        event = post_event.call_args_list[0].args[0]
+        self.assertIsInstance(event, AuditEvent)
+        self.assertEqual(
+            event.payload,
+            {"action": "created",
+             "object": {
+                 "model": "inventory.tag",
+                 "pk": str(tag.pk),
+                 "new_value": {
+                     "pk": tag.pk,
+                     "name": name,
+                     "slug": name.lower(),
+                     "meta_business_unit": {"pk": meta_business_unit.pk, "name": mbu_name},
+                     "color": "ff0000",
+                 }
+              }}
+        )
+        metadata = event.metadata.serialize()
+        metadata["tags"].sort()
+        self.assertEqual(
+            metadata,
+            {'created_at': event.metadata.created_at.isoformat(),
+             'id': str(event.metadata.uuid),
+             'index': 0,
+             'namespace': 'zentral_audit',
+             'objects': {'tag': [str(tag.pk)]},
+             'request': {'ip': '127.0.0.1',
+                         'method': 'POST',
+                         'path': '/api/inventory/tags/',
+                         'user': {'email': self.user.email,
+                                  'id': self.user.pk,
+                                  'is_remote': False,
+                                  'is_service_account': False,
+                                  'is_superuser': False,
+                                  'session': {'is_remote': False,
+                                              'mfa_authenticated': False,
+                                              'token_authenticated': True},
+                                  'username': self.user.username}},
+             'tags': ['inventory', 'zentral'],
+             'type': 'zentral_audit'}
         )
 
     # get tag
@@ -490,8 +687,8 @@ class InventoryAPITests(APITestCase):
         self.assertEqual(response.status_code, 403)
 
     def test_get_tag(self):
-        meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string())
-        tag = Tag.objects.create(meta_business_unit=meta_business_unit, name=get_random_string())
+        meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string(12))
+        tag = Tag.objects.create(meta_business_unit=meta_business_unit, name=get_random_string(12))
         self._set_permissions("inventory.view_tag")
         response = self.client.get(reverse('inventory_api:tag', args=(tag.pk,)))
         self.assertEqual(response.status_code, 200)
@@ -512,21 +709,73 @@ class InventoryAPITests(APITestCase):
         response = self.client.put(reverse('inventory_api:tag', args=(tag.pk,)))
         self.assertEqual(response.status_code, 403)
 
-    def test_update_tag(self):
-        tag = Tag.objects.create(name=get_random_string(12))
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_update_tag(self, post_event):
+        name = get_random_string(12)
+        tag = Tag.objects.create(name=name)
+        taxonomy = Taxonomy.objects.create(name=get_random_string(12))
         self._set_permissions("inventory.change_tag")
         url = reverse('inventory_api:tag', args=(tag.pk,))
         updated_name = get_random_string(12)
-        data = {'name': updated_name}
-        response = self.client.put(url, data, format='json')
+        data = {'name': updated_name, 'taxonomy': taxonomy.pk}
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            response = self.client.put(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(callbacks), 1)
         tag.refresh_from_db()
         self.assertEqual(tag.name, updated_name)
+        event = post_event.call_args_list[0].args[0]
+        self.assertIsInstance(event, AuditEvent)
+        self.assertEqual(
+            event.payload,
+            {"action": "updated",
+             "object": {
+                 "model": "inventory.tag",
+                 "pk": str(tag.pk),
+                 "new_value": {
+                     "pk": tag.pk,
+                     "name": updated_name,
+                     "slug": updated_name.lower(),
+                     "taxonomy": {"pk": taxonomy.pk, "name": taxonomy.name},
+                     "color": "0079bf",
+                 },
+                 "prev_value": {
+                     "pk": tag.pk,
+                     "name": name,
+                     "slug": name.lower(),
+                     "color": "0079bf",
+                 },
+             }}
+        )
+        metadata = event.metadata.serialize()
+        metadata["tags"].sort()
+        self.assertEqual(
+            metadata,
+            {'created_at': event.metadata.created_at.isoformat(),
+             'id': str(event.metadata.uuid),
+             'index': 0,
+             'namespace': 'zentral_audit',
+             'objects': {'tag': [str(tag.pk)]},
+             'request': {'ip': '127.0.0.1',
+                         'method': 'PUT',
+                         'path': f'/api/inventory/tags/{tag.pk}/',
+                         'user': {'email': self.user.email,
+                                  'id': self.user.pk,
+                                  'is_remote': False,
+                                  'is_service_account': False,
+                                  'is_superuser': False,
+                                  'session': {'is_remote': False,
+                                              'mfa_authenticated': False,
+                                              'token_authenticated': True},
+                                  'username': self.user.username}},
+             'tags': ['inventory', 'zentral'],
+             'type': 'zentral_audit'}
+        )
 
     def test_update_tag_name_error(self):
         name = get_random_string(12)
         Tag.objects.create(name=name)
-        tag = Tag.objects.create(name=get_random_string())
+        tag = Tag.objects.create(name=get_random_string(12))
         self._set_permissions("inventory.change_tag")
         url = reverse('inventory_api:tag', args=(tag.pk,))
         data = {'name': name}
@@ -541,12 +790,56 @@ class InventoryAPITests(APITestCase):
         response = self.client.delete(reverse('inventory_api:tag', args=(tag.pk,)))
         self.assertEqual(response.status_code, 403)
 
-    def test_delete_tag(self):
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_delete_tag(self, post_event):
         tag = Tag.objects.create(name=get_random_string(12))
+        prev_pk = tag.pk
         self._set_permissions("inventory.delete_tag")
-        response = self.client.delete(reverse('inventory_api:tag', args=(tag.pk,)))
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            response = self.client.delete(reverse('inventory_api:tag', args=(tag.pk,)))
         self.assertEqual(response.status_code, 204)
+        self.assertEqual(len(callbacks), 1)
         self.assertEqual(Tag.objects.filter(pk=tag.pk).count(), 0)
+        event = post_event.call_args_list[0].args[0]
+        self.assertIsInstance(event, AuditEvent)
+        self.assertEqual(
+            event.payload,
+            {"action": "deleted",
+             "object": {
+                 "model": "inventory.tag",
+                 "pk": str(prev_pk),
+                 "prev_value": {
+                     "pk": prev_pk,
+                     "name": tag.name,
+                     "slug": tag.name.lower(),
+                     "color": "0079bf",
+                 },
+             }}
+        )
+        metadata = event.metadata.serialize()
+        metadata["tags"].sort()
+        self.assertEqual(
+            metadata,
+            {'created_at': event.metadata.created_at.isoformat(),
+             'id': str(event.metadata.uuid),
+             'index': 0,
+             'namespace': 'zentral_audit',
+             'objects': {'tag': [str(prev_pk)]},
+             'request': {'ip': '127.0.0.1',
+                         'method': 'DELETE',
+                         'path': f'/api/inventory/tags/{prev_pk}/',
+                         'user': {'email': self.user.email,
+                                  'id': self.user.pk,
+                                  'is_remote': False,
+                                  'is_service_account': False,
+                                  'is_superuser': False,
+                                  'session': {'is_remote': False,
+                                              'mfa_authenticated': False,
+                                              'token_authenticated': True},
+                                  'username': self.user.username}},
+             'tags': ['inventory', 'zentral'],
+             'type': 'zentral_audit'}
+        )
 
     # list tag
 
@@ -555,8 +848,8 @@ class InventoryAPITests(APITestCase):
         self.assertEqual(response.status_code, 403)
 
     def test_list_tag(self):
-        meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string())
-        taxonomy = Taxonomy.objects.create(name=get_random_string())
+        meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string(12))
+        taxonomy = Taxonomy.objects.create(name=get_random_string(12))
         tag = Tag.objects.create(
             taxonomy=taxonomy,
             meta_business_unit=meta_business_unit,
@@ -583,13 +876,17 @@ class InventoryAPITests(APITestCase):
         response = self.client.post(reverse('inventory_api:taxonomies'), data)
         self.assertEqual(response.status_code, 403)
 
-    def test_create_taxonomy(self):
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_create_taxonomy(self, post_event):
         meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string(12))
-        data = {'meta_business_unit': meta_business_unit.pk, 'name': 'TestTax0'}
+        name = get_random_string(12)
+        data = {'meta_business_unit': meta_business_unit.pk, 'name': name}
         self._set_permissions("inventory.add_taxonomy")
-        response = self.client.post(reverse('inventory_api:taxonomies'), data, format='json')
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            response = self.client.post(reverse('inventory_api:taxonomies'), data, format='json')
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        taxonomy = Taxonomy.objects.get(name='TestTax0')
+        self.assertEqual(len(callbacks), 1)
+        taxonomy = Taxonomy.objects.get(name=name)
         self.assertEqual(taxonomy.meta_business_unit, meta_business_unit)
         self.assertEqual(taxonomy.name, data["name"])
         self.assertEqual(
@@ -600,6 +897,47 @@ class InventoryAPITests(APITestCase):
              "created_at": taxonomy.created_at.isoformat(),
              "updated_at": taxonomy.updated_at.isoformat()}
         )
+        event = post_event.call_args_list[0].args[0]
+        self.assertIsInstance(event, AuditEvent)
+        self.assertEqual(
+            event.payload,
+            {"action": "created",
+             "object": {
+                 "model": "inventory.taxonomy",
+                 "pk": str(taxonomy.pk),
+                 "new_value": {
+                     "pk": taxonomy.pk,
+                     "meta_business_unit": {"pk": meta_business_unit.pk, "name": meta_business_unit.name},
+                     "name": name,
+                     "created_at": taxonomy.created_at,
+                     "updated_at": taxonomy.updated_at
+                 }
+              }}
+        )
+        metadata = event.metadata.serialize()
+        metadata["tags"].sort()
+        self.assertEqual(
+            metadata,
+            {'created_at': event.metadata.created_at.isoformat(),
+             'id': str(event.metadata.uuid),
+             'index': 0,
+             'namespace': 'zentral_audit',
+             'objects': {'taxonomy': [str(taxonomy.pk)]},
+             'request': {'ip': '127.0.0.1',
+                         'method': 'POST',
+                         'path': '/api/inventory/taxonomies/',
+                         'user': {'email': self.user.email,
+                                  'id': self.user.pk,
+                                  'is_remote': False,
+                                  'is_service_account': False,
+                                  'is_superuser': False,
+                                  'session': {'is_remote': False,
+                                              'mfa_authenticated': False,
+                                              'token_authenticated': True},
+                                  'username': self.user.username}},
+             'tags': ['inventory', 'zentral'],
+             'type': 'zentral_audit'}
+        )
 
     # get taxonomy
 
@@ -609,8 +947,8 @@ class InventoryAPITests(APITestCase):
         self.assertEqual(response.status_code, 403)
 
     def test_get_taxonomy(self):
-        meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string())
-        taxonomy = Taxonomy.objects.create(meta_business_unit=meta_business_unit, name=get_random_string())
+        meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string(12))
+        taxonomy = Taxonomy.objects.create(meta_business_unit=meta_business_unit, name=get_random_string(12))
         self._set_permissions("inventory.view_taxonomy")
         response = self.client.get(reverse('inventory_api:taxonomy', args=(taxonomy.pk,)))
         self.assertEqual(response.status_code, 200)
@@ -630,21 +968,72 @@ class InventoryAPITests(APITestCase):
         response = self.client.put(reverse('inventory_api:taxonomy', args=(taxonomy.pk,)))
         self.assertEqual(response.status_code, 403)
 
-    def test_update_taxonomy(self):
-        taxonomy = Taxonomy.objects.create(name=get_random_string(12))
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_update_taxonomy(self, post_event):
+        name = get_random_string(12)
+        taxonomy = Taxonomy.objects.create(name=name)
+        prev_updated_at = taxonomy.updated_at
         self._set_permissions("inventory.change_taxonomy")
         url = reverse('inventory_api:taxonomy', args=(taxonomy.pk,))
         updated_name = get_random_string(12)
         data = {'name': updated_name}
-        response = self.client.put(url, data, format='json')
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            response = self.client.put(url, data, format='json')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(callbacks), 1)
         taxonomy.refresh_from_db()
         self.assertEqual(taxonomy.name, updated_name)
+        event = post_event.call_args_list[0].args[0]
+        self.assertIsInstance(event, AuditEvent)
+        self.assertEqual(
+            event.payload,
+            {"action": "updated",
+             "object": {
+                 "model": "inventory.taxonomy",
+                 "pk": str(taxonomy.pk),
+                 "new_value": {
+                     "pk": taxonomy.pk,
+                     "name": updated_name,
+                     "created_at": taxonomy.created_at,
+                     "updated_at": taxonomy.updated_at,
+                 },
+                 "prev_value": {
+                     "pk": taxonomy.pk,
+                     "name": name,
+                     "created_at": taxonomy.created_at,
+                     "updated_at": prev_updated_at,
+                 }
+              }}
+        )
+        metadata = event.metadata.serialize()
+        metadata["tags"].sort()
+        self.assertEqual(
+            metadata,
+            {'created_at': event.metadata.created_at.isoformat(),
+             'id': str(event.metadata.uuid),
+             'index': 0,
+             'namespace': 'zentral_audit',
+             'objects': {'taxonomy': [str(taxonomy.pk)]},
+             'request': {'ip': '127.0.0.1',
+                         'method': 'PUT',
+                         'path': f'/api/inventory/taxonomies/{taxonomy.pk}/',
+                         'user': {'email': self.user.email,
+                                  'id': self.user.pk,
+                                  'is_remote': False,
+                                  'is_service_account': False,
+                                  'is_superuser': False,
+                                  'session': {'is_remote': False,
+                                              'mfa_authenticated': False,
+                                              'token_authenticated': True},
+                                  'username': self.user.username}},
+             'tags': ['inventory', 'zentral'],
+             'type': 'zentral_audit'}
+        )
 
     def test_update_taxonomy_name_error(self):
         name = get_random_string(12)
         Taxonomy.objects.create(name=name)
-        taxonomy = Taxonomy.objects.create(name=get_random_string())
+        taxonomy = Taxonomy.objects.create(name=get_random_string(12))
         self._set_permissions("inventory.change_taxonomy")
         url = reverse('inventory_api:taxonomy', args=(taxonomy.pk,))
         data = {'name': name}
@@ -659,12 +1048,56 @@ class InventoryAPITests(APITestCase):
         response = self.client.delete(reverse('inventory_api:taxonomy', args=(taxonomy.pk,)))
         self.assertEqual(response.status_code, 403)
 
-    def test_delete_taxonomy(self):
+    @patch("zentral.core.queues.backends.kombu.EventQueues.post_event")
+    def test_delete_taxonomy(self, post_event):
         taxonomy = Taxonomy.objects.create(name=get_random_string(12))
+        prev_pk = taxonomy.pk
         self._set_permissions("inventory.delete_taxonomy")
-        response = self.client.delete(reverse('inventory_api:taxonomy', args=(taxonomy.pk,)))
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            response = self.client.delete(reverse('inventory_api:taxonomy', args=(taxonomy.pk,)))
         self.assertEqual(response.status_code, 204)
+        self.assertEqual(len(callbacks), 1)
         self.assertEqual(Taxonomy.objects.filter(pk=taxonomy.pk).count(), 0)
+        event = post_event.call_args_list[0].args[0]
+        self.assertIsInstance(event, AuditEvent)
+        self.assertEqual(
+            event.payload,
+            {"action": "deleted",
+             "object": {
+                 "model": "inventory.taxonomy",
+                 "pk": str(prev_pk),
+                 "prev_value": {
+                     "pk": prev_pk,
+                     "name": taxonomy.name,
+                     "created_at": taxonomy.created_at,
+                     "updated_at": taxonomy.updated_at,
+                 },
+              }}
+        )
+        metadata = event.metadata.serialize()
+        metadata["tags"].sort()
+        self.assertEqual(
+            metadata,
+            {'created_at': event.metadata.created_at.isoformat(),
+             'id': str(event.metadata.uuid),
+             'index': 0,
+             'namespace': 'zentral_audit',
+             'objects': {'taxonomy': [str(taxonomy.pk)]},
+             'request': {'ip': '127.0.0.1',
+                         'method': 'DELETE',
+                         'path': f'/api/inventory/taxonomies/{taxonomy.pk}/',
+                         'user': {'email': self.user.email,
+                                  'id': self.user.pk,
+                                  'is_remote': False,
+                                  'is_service_account': False,
+                                  'is_superuser': False,
+                                  'session': {'is_remote': False,
+                                              'mfa_authenticated': False,
+                                              'token_authenticated': True},
+                                  'username': self.user.username}},
+             'tags': ['inventory', 'zentral'],
+             'type': 'zentral_audit'}
+        )
 
     # list taxonomy
 
@@ -673,7 +1106,7 @@ class InventoryAPITests(APITestCase):
         self.assertEqual(response.status_code, 403)
 
     def test_list_taxonomy(self):
-        meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string())
+        meta_business_unit = MetaBusinessUnit.objects.create(name=get_random_string(12))
         taxonomy = Taxonomy.objects.create(
             meta_business_unit=meta_business_unit,
             name=get_random_string(12)

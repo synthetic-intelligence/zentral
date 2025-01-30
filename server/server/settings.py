@@ -25,11 +25,12 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = django_zentral_settings.get('SECRET_KEY', utils.get_random_secret_key())
+SECRET_KEY_FALLBACKS = django_zentral_settings.get('SECRET_KEY_FALLBACKS', [])
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = django_zentral_settings.get('DEBUG', False)
 
-ALLOWED_HOSTS = django_zentral_settings.get('ALLOWED_HOSTS', [])
+ALLOWED_HOSTS = list(django_zentral_settings.get('ALLOWED_HOSTS', []))
 if not ALLOWED_HOSTS:
     fqdn = zentral_settings.get("api", {}).get("fqdn")
     if fqdn:
@@ -68,19 +69,16 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'bootstrapform',
     'rest_framework',
     'django_filters',
     'django_celery_results',
     'accounts',
     'base',
-    'realms',
 ]
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'accounts.api_authentication.APITokenAuthentication',
-        'rest_framework.authentication.SessionAuthentication',
     ),
     # disable the Browsable API Renderer
     'DEFAULT_RENDERER_CLASSES': (
@@ -96,20 +94,44 @@ REST_FRAMEWORK = {
 
 AUTH_USER_MODEL = 'accounts.User'
 
-AUTH_PASSWORD_VALIDATORS = django_zentral_settings.get("AUTH_PASSWORD_VALIDATORS", [])
+AUTH_PASSWORD_VALIDATORS = django_zentral_settings.get("AUTH_PASSWORD_VALIDATORS", [
+    {
+        "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator",
+    },
+    {
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+    },
+    {
+        "NAME": "django.contrib.auth.password_validation.CommonPasswordValidator",
+    },
+    {
+        "NAME": "django.contrib.auth.password_validation.NumericPasswordValidator",
+    },
+    {
+        "NAME": "accounts.password_validation.PasswordNotAlreadyUsedValidator",
+    },
+])
 
 AUTHENTICATION_BACKENDS = [
     'accounts.auth_backends.ZentralBackend',
     'realms.auth_backends.RealmBackend',
 ]
 
+# SESSION*
 SESSION_COOKIE_SECURE = True
+SESSION_COOKIE_SAMESITE = django_zentral_settings.get("SESSION_COOKIE_SAMESITE", "Lax")
 
 if "SESSION_COOKIE_AGE" in django_zentral_settings:
     SESSION_COOKIE_AGE = django_zentral_settings["SESSION_COOKIE_AGE"]
 
 if "SESSION_EXPIRE_AT_BROWSER_CLOSE" in django_zentral_settings:
     SESSION_EXPIRE_AT_BROWSER_CLOSE = django_zentral_settings["SESSION_EXPIRE_AT_BROWSER_CLOSE"]
+
+# CSRF*
+CSRF_COOKIE_SECURE = True
+CSRF_COOKIE_SAMESITE = "Strict"
+if "CSRF_TRUSTED_ORIGINS" in django_zentral_settings:
+    CSRF_TRUSTED_ORIGINS = django_zentral_settings["CSRF_TRUSTED_ORIGINS"]
 
 MAX_PASSWORD_AGE_DAYS = django_zentral_settings.get("MAX_PASSWORD_AGE_DAYS", None)
 
@@ -120,6 +142,7 @@ for app_name in zentral_settings.get('apps', []):
     INSTALLED_APPS.append(app_name)
 
 MIDDLEWARE = [
+    'base.middlewares.never_cache_middleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -132,16 +155,23 @@ MIDDLEWARE = [
     'base.middlewares.deployment_info_middleware',
 ]
 
+STATIC_WHITENOISE = django_zentral_settings.get("STATIC_WHITENOISE", False)
+if STATIC_WHITENOISE:
+    MIDDLEWARE.insert(MIDDLEWARE.index("django.middleware.security.SecurityMiddleware") + 1,
+                      "whitenoise.middleware.WhiteNoiseMiddleware")
+
 if MAX_PASSWORD_AGE_DAYS:
     MIDDLEWARE.insert(MIDDLEWARE.index("django.contrib.messages.middleware.MessageMiddleware") + 1,
                       "accounts.middleware.force_password_change_middleware")
 
 ROOT_URLCONF = 'server.urls'
 
+FORM_RENDERER = 'django.forms.renderers.TemplatesSetting'
+
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [os.path.join(BASE_DIR, 'templates')],
+        'DIRS': [os.path.join(BASE_DIR, 'templates'), os.path.join(BASE_DIR, 'templates/forms')],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -150,7 +180,6 @@ TEMPLATES = [
                 'django.contrib.auth.context_processors.auth',
                 'django.contrib.messages.context_processors.messages',
                 'zentral.conf.context_processors.extra_links',
-                'zentral.conf.context_processors.probe_creation_links',
             ],
         },
     },
@@ -209,35 +238,21 @@ STATICFILES_DIRS = (
 if DEBUG:
     STATIC_URL = '/static_debug/'
 else:
-    STATIC_URL = '/static/'
+    if STATIC_WHITENOISE:
+        STATIC_URL = '/static_whitenoise/'
+    else:
+        STATIC_URL = '/static/'
 STATIC_ROOT = django_zentral_settings.get("STATIC_ROOT", "/zentral_static")
-STATICFILES_STORAGE = "django.contrib.staticfiles.storage.ManifestStaticFilesStorage"
 
-
-# File storage override
-if "DEFAULT_FILE_STORAGE" in django_zentral_settings:
-    DEFAULT_FILE_STORAGE = django_zentral_settings["DEFAULT_FILE_STORAGE"]
 # Directory that will hold the files if the default file storage is used
 MEDIA_ROOT = django_zentral_settings.get("MEDIA_ROOT", "")
-# Google cloud storage options
-# https://django-storages.readthedocs.io/en/latest/backends/gcloud.html
-# credentials file necessary to sign the file download URLs
-if "GS_BUCKET_NAME" in django_zentral_settings:
-    GS_BUCKET_NAME = django_zentral_settings["GS_BUCKET_NAME"]
-if "GS_CREDENTIALS" in django_zentral_settings:
-    from google.oauth2 import service_account
-    GS_CREDENTIALS = service_account.Credentials.from_service_account_file(
-        django_zentral_settings["GS_CREDENTIALS"]
-    )
-# AWS S3 storage options
-# https://django-storages.readthedocs.io/en/latest/backends/amazon-S3.html
-AWS_S3_SIGNATURE_VERSION = "s3v4"
-if "AWS_S3_REGION_NAME" in django_zentral_settings:
-    AWS_S3_REGION_NAME = django_zentral_settings["AWS_S3_REGION_NAME"]
-if "AWS_S3_ENDPOINT_URL" in django_zentral_settings:
-    AWS_S3_ENDPOINT_URL = django_zentral_settings["AWS_S3_ENDPOINT_URL"]
-if "AWS_STORAGE_BUCKET_NAME" in django_zentral_settings:
-    AWS_STORAGE_BUCKET_NAME = django_zentral_settings["AWS_STORAGE_BUCKET_NAME"]
+
+# Storages
+STORAGES = django_zentral_settings.get("STORAGES", {})
+if "default" not in STORAGES:
+    STORAGES["default"] = {"BACKEND": "django.core.files.storage.FileSystemStorage"}
+if "staticfiles" not in STORAGES:
+    STORAGES["staticfiles"] = {"BACKEND": "django.contrib.staticfiles.storage.ManifestStaticFilesStorage"}
 
 
 # LOGGING

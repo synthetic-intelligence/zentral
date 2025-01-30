@@ -4,6 +4,8 @@ from .custom import CustomCommand  # NOQA
 from .declarative_management import DeclarativeManagement  # NOQA
 from .device_configured import DeviceConfigured  # NOQA
 from .device_information import DeviceInformation  # NOQA
+from .device_lock import DeviceLock  # NOQA
+from .erase_device import EraseDevice  # NOQA
 from .install_application import InstallApplication  # NOQA
 from .install_enterprise_application import InstallEnterpriseApplication  # NOQA
 from .installed_application_list import InstalledApplicationList  # NOQA
@@ -13,4 +15,9 @@ from .profile_list import ProfileList  # NOQA
 from .reenroll import Reenroll  # NOQA
 from .remove_application import RemoveApplication  # NOQA
 from .remove_profile import RemoveProfile  # NOQA
+from .restart_device import RestartDevice  # NOQA
+from .rotate_filevault_key import RotateFileVaultKey  # NOQA
 from .security_info import SecurityInfo  # NOQA
+from .set_firmware_password import SetFirmwarePassword  # NOQA
+from .set_recovery_lock import SetRecoveryLock  # NOQA
+from .setup_filevault import SetupFileVault  # NOQA

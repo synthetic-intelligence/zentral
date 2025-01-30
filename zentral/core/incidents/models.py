@@ -119,6 +119,13 @@ class Incident(models.Model):
                     next_statuses.remove(status)
                 except ValueError:
                     pass
+        if Status.REOPENED in next_statuses:
+            if Incident.objects.filter(
+                incident_type=self.incident_type,
+                key=self.key,
+                status__in=Status.open_values()
+            ).exists():
+                next_statuses.remove(Status.REOPENED)
         return next_statuses
 
     def get_next_status_choices(self):
@@ -133,6 +140,17 @@ class Incident(models.Model):
         if not self.pk:
             self.name = self.loaded_incident.get_name()
         return super().save(*args, **kwargs)
+
+    def get_open(self, latest):
+        """ Returns the latest Incidents with
+            Status OPEN ordered by severity DESC and created time DESC
+
+        Args:
+            latest (int): the 'latest' amount of incidents created.
+        """
+        return Incident.objects.all().filter(
+            status=Status.OPEN.value,
+            ).order_by("-severity").order_by("-created_at")[:latest]
 
 
 class MachineIncident(models.Model):

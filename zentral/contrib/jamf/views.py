@@ -1,9 +1,10 @@
 import logging
 from django.contrib import messages
-from django.contrib.auth.mixins import PermissionRequiredMixin
+from django.core.exceptions import PermissionDenied
+from django.contrib.auth.mixins import LoginRequiredMixin, PermissionRequiredMixin
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse_lazy
-from django.views.generic import DetailView, View, ListView
+from django.views.generic import DetailView, TemplateView, ListView, View
 from django.views.generic.edit import CreateView, UpdateView, DeleteView
 from zentral.utils.api_views import APIAuthError, JSONPostAPIView
 from .api_client import APIClient, APIClientError
@@ -17,6 +18,18 @@ logger = logging.getLogger('zentral.contrib.jamf.views')
 
 # setup > jamf instances
 
+class IndexView(LoginRequiredMixin, TemplateView):
+    template_name = "jamf/index.html"
+
+    def get_context_data(self, **kwargs):
+        if not self.request.user.has_module_perms("jamf"):
+            raise PermissionDenied("Not allowed")
+        ctx = super().get_context_data(**kwargs)
+        jamf_instances = JamfInstance.objects.all()
+        ctx["instances"] = jamf_instances
+        ctx["instances_count"] = jamf_instances.count()
+        return ctx
+
 
 class JamfInstancesView(PermissionRequiredMixin, ListView):
     permission_required = "jamf.view_jamfinstance"
@@ -24,13 +37,7 @@ class JamfInstancesView(PermissionRequiredMixin, ListView):
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        ctx["setup"] = True
-        jamf_instances_count = len(ctx["object_list"])
-        if jamf_instances_count == 0 or jamf_instances_count > 1:
-            suffix = "s"
-        else:
-            suffix = ""
-        ctx["title"] = "{} jamf instance{}".format(jamf_instances_count, suffix)
+        ctx["jamf_instances_count"] = ctx["object_list"].count()
         return ctx
 
 
@@ -41,8 +48,7 @@ class CreateJamfInstanceView(PermissionRequiredMixin, CreateView):
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        ctx["setup"] = True
-        ctx["title"] = "Create jamf instance"
+        ctx["title"] = "Create Instance"
         return ctx
 
 
@@ -52,7 +58,6 @@ class JamfInstanceView(PermissionRequiredMixin, DetailView):
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        ctx["setup"] = True
         ctx["title"] = str(ctx["object"])
         ctx["tag_configs"] = list(ctx["object"].tagconfig_set.select_related("taxonomy").all())
         ctx["tag_config_count"] = len(ctx["tag_configs"])
@@ -86,8 +91,7 @@ class UpdateJamfInstanceView(PermissionRequiredMixin, UpdateView):
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        ctx["setup"] = True
-        ctx["title"] = "Update jamf instance"
+        ctx["title"] = "Update Instance"
         return ctx
 
 
@@ -98,12 +102,10 @@ class DeleteJamfInstanceView(PermissionRequiredMixin, DeleteView):
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        ctx["setup"] = True
-        ctx["title"] = "Delete jamf instance"
+        ctx["title"] = "Delete Instance"
         return ctx
 
-    def delete(self, request, *args, **kwargs):
-        self.object = self.get_object()
+    def form_valid(self, form):
         success_url = self.get_success_url()
         api_client = APIClient(**self.object.serialize(decrypt_password=True))
         jamf_instance_base_url = self.object.base_url()
@@ -111,11 +113,11 @@ class DeleteJamfInstanceView(PermissionRequiredMixin, DeleteView):
             api_client.cleanup()
         except APIClientError:
             msg = "Could not remove webhooks configuration on {}.".format(jamf_instance_base_url)
-            messages.warning(request, msg)
+            messages.warning(self.request, msg)
             logger.exception(msg)
         else:
             msg = "Removed webhooks configuration on {}.".format(jamf_instance_base_url)
-            messages.info(request, msg)
+            messages.info(self.request, msg)
             logger.info(msg)
         self.object.delete()
         return redirect(success_url)
@@ -132,7 +134,6 @@ class CreateTagConfigView(PermissionRequiredMixin, CreateView):
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        ctx["setup"] = True
         ctx["title"] = "Create tag config"
         ctx["jamf_instance"] = self.jamf_instance
         return ctx
@@ -155,7 +156,6 @@ class UpdateTagConfigView(PermissionRequiredMixin, UpdateView):
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        ctx["setup"] = True
         ctx["title"] = "Update tag config"
         ctx["jamf_instance"] = self.jamf_instance
         return ctx
@@ -177,7 +177,6 @@ class DeleteTagConfigView(PermissionRequiredMixin, DeleteView):
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
-        ctx["setup"] = True
         ctx["title"] = "Delete tag config"
         ctx["jamf_instance"] = self.jamf_instance
         return ctx

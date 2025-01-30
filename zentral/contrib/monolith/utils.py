@@ -2,7 +2,6 @@ import hashlib
 import logging
 import plistlib
 from django.core.files.base import ContentFile
-from django.template.loader import get_template
 from zentral.utils.payloads import generate_payload_uuid, get_payload_identifier
 from zentral.utils.osx_package import get_tls_hostname
 from zentral.utils.text import shard as compute_shard
@@ -19,16 +18,31 @@ def make_package_info(builder, manifest_enrollment_package, package_content):
     installer_item_hash = h.hexdigest()
     installer_item_size = len(package_content)
     installed_size = installer_item_size * 10  # TODO: bug
-    postinstall_script = (
+    installcheck_script = (
         '#!/usr/local/munki/munki-python\n'
-        'import os\n'
+        'import plistlib\n'
+        'import sys\n'
         '\n'
-        'RECEIPTS_DIR = "/var/db/receipts/"\n'
         '\n'
-        'for filename in os.listdir(RECEIPTS_DIR):\n'
-        '    if filename.startswith("{}") and not filename.startswith("{}"):\n'
-        '        os.unlink(os.path.join(RECEIPTS_DIR, filename))\n'
-    ).format(builder.base_package_identifier, builder.package_identifier)
+        'def do_install_check():\n'
+        f'    with open("/usr/local/zentral/{builder.local_subfolder}/enrollment.plist", "rb") as f:\n'
+        '        info = plistlib.load(f)\n'
+        '    return (\n'
+        f'        info["enrollment"]["id"] == {builder.enrollment.pk}\n'
+        f'        and info["enrollment"]["version"] == {builder.enrollment.version}\n'
+        f'        and info["fqdn"] == "{builder.get_tls_hostname()}"\n'
+        '    )\n'
+        '\n'
+        '\n'
+        'if __name__ == "__main__":\n'
+        '    try:\n'
+        '        ok = do_install_check()\n'
+        '    except Exception:\n'
+        '        pass\n'
+        '    else:\n'
+        '        if ok:\n'
+        '            sys.exit(1)\n'
+    )
     return {'description': '{} package'.format(builder.name),
             'display_name': builder.name,
             'installed_size': installed_size,
@@ -36,7 +50,7 @@ def make_package_info(builder, manifest_enrollment_package, package_content):
             'installer_item_size': installer_item_size,
             'minimum_os_version': '10.9.0',  # TODO: hardcoded
             'name': manifest_enrollment_package.get_name(),
-            'postinstall_script': postinstall_script,
+            'installcheck_script': installcheck_script,
             'receipts': [
                 {'installed_size': installed_size,
                  'packageid': builder.package_identifier,
@@ -60,39 +74,11 @@ def build_manifest_enrollment_package(mep):
                   save=True)
 
 
-def make_printer_package_info(printer):
-    pkg_info = {
-        'name': printer.get_pkg_info_name(),
-        'version': "{}.0".format(printer.version),
-        'display_name': "Printer '{}'".format(printer.name),
-        'description': "Printer '{}' installer".format(printer.name),
-        'autoremove': True,
-        'unattended_install': True,
-        'uninstall_method': 'uninstall_script',
-        'installer_type': 'nopkg',
-        'uninstallable': True,
-        'unattended_uninstall': True,
-        'minimum_munki_version': '2.2',
-        'minimum_os_version': '10.6.0',  # TODO: HARDCODED !!!
-    }
-    # installcheck script
-    for template_name, key in (("install_check.sh", "installcheck_script"),
-                               ("postinstall.sh", "postinstall_script"),
-                               ("uninstall_check.sh", "uninstallcheck_script"),  # TODO needed for autoremove, why?
-                               ("uninstall.sh", "uninstall_script")):
-        tmpl = get_template("monolith/printer_pkginfo/{}".format(template_name))
-        pkg_info[key] = tmpl.render({"printer": printer})
-    required_package = printer.required_package
-    if required_package:
-        pkg_info["requires"] = [required_package.name]
-    return pkg_info
-
-
 def build_configuration(enrollment):
     # TODO: hardcoded
     config = {
         "ClientIdentifier": "$SERIALNUMBER",
-        "SoftwareRepoURL": "https://{}/monolith/munki_repo".format(get_tls_hostname()),
+        "SoftwareRepoURL": "https://{}/public/monolith/munki_repo".format(get_tls_hostname()),
         "FollowHTTPRedirects": "all",
         # "ManifestURL": None,  # no special Manifest URL with monolith
         # force redirect via monolith for Icon and Client Resource
@@ -109,7 +95,7 @@ def build_configuration(enrollment):
 
 def build_configuration_plist(enrollment):
     content = plistlib.dumps(build_configuration(enrollment))
-    return get_payload_identifier("monolith.settings.plist"), content
+    return f"zentral_monolith_configuration.enrollment_{enrollment.pk}.plist", content
 
 
 def build_configuration_profile(enrollment):
@@ -132,7 +118,7 @@ def build_configuration_profile(enrollment):
                                   "PayloadUUID": generate_payload_uuid(),
                                   "PayloadVersion": 1}
     content = plistlib.dumps(configuration_profile_data)
-    return get_payload_identifier("monolith.settings.mobileconfig"), content
+    return f"zentral_monolith_configuration.enrollment_{enrollment.pk}.mobileconfig", content
 
 
 def test_monolith_object_inclusion(key, options, serial_number, tag_names):

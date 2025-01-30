@@ -31,6 +31,14 @@ class InventorySearchViewsTestCase(TestCase):
                         "links": [{"anchor_text": "group link",
                                    "url": "http://group-link.de"}]}],
             "serial_number": "0123456789",
+            "system_info": {"computer_name": "fomo computer name yolo",
+                            "hostname": "fomo hostname fomo"},
+            "principal_user": {
+                "source": {"type": "LOGGED_IN_USER", "properties": {"method": "System Configuration"}},
+                "unique_id": "yolo@example.com",
+                "principal_name": "Fomo Principal Name Yolo",
+                "display_name": "Fomo Display Name Yolo",
+            },
             "os_version": {'name': 'OS X', 'major': 10, 'minor': 11, 'patch': 1},
             "osx_app_instances": [
                 {'app': {'bundle_id': 'io.zentral.baller',
@@ -96,7 +104,55 @@ class InventorySearchViewsTestCase(TestCase):
         self._login("inventory.view_machinesnapshot")
         response = self.client.get(reverse("inventory:index"), {"ls": "7d", "sf": "mbu-t-mis-tp-pf-hm-osv"})
         self.assertTemplateUsed(response, "inventory/machine_list.html")
-        self.assertContains(response, "1 Machine")
+        self.assertContains(response, "Machine (1)")
+
+    # computer name
+
+    def test_computer_name_search(self):
+        self._login("inventory.view_machinesnapshot")
+        response = self.client.get(
+            reverse("inventory:index"),
+            {"ls": "7d", "sf": "mbu-t-mis-tp-pf-hm-osv", "cn": "Computer name Yol"}
+        )
+        self.assertRedirects(response, reverse("inventory:machine", args=("0123456789",)))
+
+    def test_computer_name_search_special_char_no_result(self):
+        self._login("inventory.view_machinesnapshot")
+        response = self.client.get(
+            reverse("inventory:index"),
+            {"ls": "7d", "sf": "mbu-t-mis-tp-pf-hm-osv", "cn": "Computer\\"}
+        )
+        self.assertTemplateUsed(response, "inventory/machine_list.html")
+        self.assertContains(response, "Machines (0)")
+
+    # principal user
+
+    def test_principal_user_principal_name_search(self):
+        self._login("inventory.view_machinesnapshot")
+        response = self.client.get(
+            reverse("inventory:index"),
+            {"ls": "7d", "sf": "mbu-t-mis-tp-pf-hm-osv", "pu": "principal name"}
+        )
+        self.assertRedirects(response, reverse("inventory:machine", args=("0123456789",)))
+
+    def test_principal_user_display_name_search(self):
+        self._login("inventory.view_machinesnapshot")
+        response = self.client.get(
+            reverse("inventory:index"),
+            {"ls": "7d", "sf": "mbu-t-mis-tp-pf-hm-osv", "pu": "display name"}
+        )
+        self.assertRedirects(response, reverse("inventory:machine", args=("0123456789",)))
+
+    def test_principal_user_search_special_char_no_result(self):
+        self._login("inventory.view_machinesnapshot")
+        response = self.client.get(
+            reverse("inventory:index"),
+            {"ls": "7d", "sf": "mbu-t-mis-tp-pf-hm-osv", "pu": "Display Name\\"}
+        )
+        self.assertTemplateUsed(response, "inventory/machine_list.html")
+        self.assertContains(response, "Machines (0)")
+
+    # MAC address
 
     def test_index_mac_address_no_result(self):
         self._login("inventory.view_machinesnapshot")
@@ -105,7 +161,7 @@ class InventorySearchViewsTestCase(TestCase):
             {"ls": "7d", "sf": "mbu-t-mis-tp-pf-hm-osv", "ma": get_random_string(12)}
         )
         self.assertTemplateUsed(response, "inventory/machine_list.html")
-        self.assertContains(response, "0 Machines")
+        self.assertContains(response, "Machines (0)")
 
     def test_index_mac_address_redirect(self):
         self._login("inventory.view_machinesnapshot")
@@ -116,6 +172,8 @@ class InventorySearchViewsTestCase(TestCase):
         )
         self.assertRedirects(response, reverse("inventory:machine", args=("0123456789",)))
         self.assertTemplateUsed(response, "inventory/machine_detail.html")
+
+    # bundle filter
 
     def test_index_add_bundle_filter(self):
         self._login("inventory.view_machinesnapshot")
@@ -138,4 +196,4 @@ class InventorySearchViewsTestCase(TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertTemplateUsed(response, "inventory/machine_list.html")
-        self.assertFormError(response, "bundle_filter_form", None, "Choose a bundle id or a bundle name.")
+        self.assertFormError(response.context["bundle_filter_form"], None, "Choose a bundle id or a bundle name.")
