@@ -1,4 +1,4 @@
-from cedarpy import format_policies
+from cedarpy import format_policies, PolicySet
 from django.contrib.auth.models import Group
 from django.test import TestCase
 from django.utils.crypto import get_random_string
@@ -19,23 +19,19 @@ class PBACCedarTestCase(TestCase):
         pc = PoliciesCache(with_sync=True)
         self.assertFalse(pc._sync_started)
         self.assertIsNone(pc._last_refresh_ts)
-        # not cached
-        self.assertEqual(
-            pc.all_policies_concatenated,
-            format_policies('permit (principal in Role::"0", action, resource);').strip(),
-        )
+        # not cached: policies are parsed once into a reusable PolicySet
+        policy_set = pc.policy_set
+        self.assertIsInstance(policy_set, PolicySet)
+        self.assertEqual(len(policy_set), 1)
         self.assertTrue(pc._sync_started)
         ts = pc._last_refresh_ts
         self.assertIsNotNone(ts)
-        # cached
-        self.assertEqual(
-            pc.all_policies_concatenated,
-            format_policies('permit (principal in Role::"0", action, resource);').strip(),
-        )
+        # cached: the same parsed handle is returned, no refresh
+        self.assertIs(pc.policy_set, policy_set)
         self.assertEqual(ts, pc._last_refresh_ts)
         # clear
         pc.clear()
-        self.assertIsNone(pc._concatenated_policies)
+        self.assertIsNone(pc._policy_set)
 
 
 class PBACSchemaCachedPropertyTestCase(TestCase):

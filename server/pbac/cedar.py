@@ -5,7 +5,7 @@ import time
 from typing import Optional
 import weakref
 
-from cedarpy import is_authorized, is_authorized_batch
+from cedarpy import is_authorized, is_authorized_batch, PolicySet
 
 from base.notifier import notifier
 from .entities import Entity, Request
@@ -21,7 +21,7 @@ class PoliciesCache:
     max_age_seconds = 300
 
     def __init__(self, with_sync=False):
-        self._concatenated_policies = None
+        self._policy_set = None
         self._last_refresh_ts = None
         self._lock = threading.Lock()
         self.with_sync = with_sync  # if False, every read will hit the DB
@@ -29,7 +29,7 @@ class PoliciesCache:
 
     def clear(self, *args, **kwargs):
         with self._lock:
-            self._concatenated_policies = None
+            self._policy_set = None
             self._last_refresh_ts = None
             logger.debug("Policies cache sync cleared")
 
@@ -46,7 +46,7 @@ class PoliciesCache:
         self._start_sync()
         if (
             self.with_sync
-            and self._concatenated_policies is not None
+            and self._policy_set is not None
             and self._last_refresh_ts is not None
             and time.monotonic() - self._last_refresh_ts <= self.max_age_seconds
         ):
@@ -54,19 +54,21 @@ class PoliciesCache:
             return
         logger.debug("Refresh policies cache")
         from accounts.models import Policy  # TODO reorganize to fix circular import?
-        self._concatenated_policies = "\n".join(
+        concatenated_policies = "\n".join(
             p.source.strip()
             for p in Policy.objects.filter(type=Policy.Type.CEDAR, is_active=True)
         ).strip()
+        # Policies stored in the DB are known-good so this should never raise an error
+        self._policy_set = PolicySet.from_str(concatenated_policies)
         self._last_refresh_ts = time.monotonic()
 
     @property
-    def all_policies_concatenated(self):
+    def policy_set(self):
         with self._lock:
             # It might trigger a DB request, but we are OK because the DB query is cheap.
             # Also, the lock is not shared across the application.
             self._refresh()
-            return self._concatenated_policies
+            return self._policy_set
 
 
 # used for the tests
@@ -117,10 +119,12 @@ def authorize_request(request: Request) -> None:
     # policies stored in the DB are known-good. Re-validating per request
     # would add ~16ms / call (cedarpy re-parses the ~120KB schema on every
     # is_authorized call), which dominates view rendering when there are
-    # multiple has_perm / has_module_perms checks.
+    # multiple has_perm / has_module_perms checks. For the same reason the
+    # policies are pre-parsed into a PolicySet by policies_cache, so
+    # is_authorized doesn't re-parse them on every call either.
     cedar_result = is_authorized(
         _serialize_request(request),
-        policies_cache.all_policies_concatenated,
+        policies_cache.policy_set,
         _serialize_requests_entities([request]),
     )
     request.is_authorized = cedar_result.allowed
@@ -132,7 +136,7 @@ def authorize_requests(requests: list[Request]) -> None:
     req_dict = {r.correlation_id: r for r in requests}
     for cedar_result in is_authorized_batch(
         (_serialize_request(r, correlation_id=r.correlation_id) for r in requests),
-        policies_cache.all_policies_concatenated,
+        policies_cache.policy_set,
         _serialize_requests_entities(requests),
     ):
         req_dict[cedar_result.correlation_id].is_authorized = cedar_result.allowed
