@@ -1,6 +1,7 @@
 import json
 import os.path
 import queue
+import signal
 import threading
 from datetime import datetime
 from unittest.mock import Mock, patch
@@ -13,7 +14,7 @@ from django.utils.text import slugify
 from pyarrow.fs import LocalFileSystem
 
 from zentral.conf.config import ConfigDict
-from zentral.core.queues.backends.aws_sns_sqs.consumer import ConsumerProducerFinalThread
+from zentral.core.queues.backends.aws_sns_sqs.consumer import BaseConsumer, ConsumerProducerFinalThread
 from zentral.core.queues.backends.aws_sns_sqs.sns import SNSPublishThread
 from zentral.core.queues.backends.aws_sns_sqs.sqs import SQSSendThread
 from zentral.core.queues.backends.aws_sns_sqs import (
@@ -729,3 +730,34 @@ class AWSSNSSQSQueuesTestCase(TestCase):
         self.assertIs(args[2], eq._raw_events_queue)
         SQSSendThread.return_value.start.assert_called_once()
         self.assertEqual(eq._raw_events_queue.qsize(), 2)
+
+    @patch("zentral.core.queues.backends.aws_sns_sqs.setup_signal_handler")
+    def test_setup_graceful_stop_wires_signals_once(self, setup_signal_handler):
+        setup_signal_handler.return_value = {signal.SIGTERM: None, signal.SIGINT: None}
+        eq = self.get_queues()
+        self.assertIsNone(eq._stop_event)
+        self.assertEqual(eq._previous_signal_handlers, {})
+        eq._setup_graceful_stop()
+        self.assertIsInstance(eq._stop_event, threading.Event)
+        setup_signal_handler.assert_called_once_with(eq._graceful_stop)
+        self.assertEqual(eq._previous_signal_handlers, {signal.SIGTERM: None, signal.SIGINT: None})
+        # already set up: a second call must not re-wire the handlers
+        eq._setup_graceful_stop()
+        setup_signal_handler.assert_called_once()
+
+    # consumers
+
+    @patch("zentral.core.queues.backends.aws_sns_sqs.consumer.setup_signal_handler")
+    @patch("zentral.core.queues.backends.aws_sns_sqs.consumer.SQSDeleteThread")
+    @patch("zentral.core.queues.backends.aws_sns_sqs.consumer.SQSReceiveThread")
+    def test_base_consumer_run_wires_signal_handler(self, SQSReceiveThread, SQSDeleteThread, setup_signal_handler):
+        consumer = BaseConsumer("https://www.example.com/queue", {})
+        consumer.start_run_loop = Mock()
+        self.assertEqual(consumer.run(), 0)
+        setup_signal_handler.assert_called_once_with(consumer._handle_signal)
+        consumer.start_run_loop.assert_called_once()
+        # threads are started, then joined on the graceful-stop path
+        for thread in consumer._threads:
+            thread.start.assert_called_once()
+            thread.join.assert_called_once()
+        self.assertTrue(consumer.stop_event.is_set())

@@ -1,6 +1,7 @@
 from unittest.mock import Mock, patch
 from django.test import TestCase
 from zentral.core.queues.backends.google_pubsub import EventQueues
+from zentral.core.queues.backends.google_pubsub.consumer import BaseWorker
 
 
 class GooglePubSubQueuesTestCase(TestCase):
@@ -47,3 +48,29 @@ class GooglePubSubQueuesTestCase(TestCase):
         self.assertIsInstance(publish.call_args_list[0].args[1], bytes)
         self.assertEqual(publish.call_args_list[0].kwargs, {"event_type": "yolo"})
         self.assertEqual(publish.call_args_list[1].kwargs, {"routing_key": "routing-key"})
+
+
+class GooglePubSubBaseWorkerTestCase(TestCase):
+    maxDiff = None
+
+    @patch("zentral.core.queues.backends.google_pubsub.consumer.setup_signal_handler")
+    def test_run_wires_signal_handler(self, setup_signal_handler):
+        worker = BaseWorker("projects/p/topics/events", None)
+        worker.ensure_subscription = Mock()
+        worker.start_metrics_exporter = Mock()
+        worker.do_run = Mock()
+        self.assertEqual(worker.run(), 0)
+        worker.ensure_subscription.assert_called_once()
+        setup_signal_handler.assert_called_once_with(worker.handle_signal)
+        worker.start_metrics_exporter.assert_called_once()
+        worker.do_run.assert_called_once()
+
+    @patch("zentral.core.queues.backends.google_pubsub.consumer.setup_signal_handler")
+    def test_run_skips_signal_handler_when_subscription_fails(self, setup_signal_handler):
+        worker = BaseWorker("projects/p/topics/events", None)
+        worker.ensure_subscription = Mock(side_effect=ValueError)
+        worker.start_metrics_exporter = Mock()
+        worker.do_run = Mock()
+        self.assertEqual(worker.run(), 1)
+        setup_signal_handler.assert_not_called()
+        worker.do_run.assert_not_called()
