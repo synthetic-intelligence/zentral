@@ -1,3 +1,11 @@
+## 2026.5
+
+
+### Bug fixes
+
+Fixed a 500 error on bulk machine tag changes made through the API with an expiring token.
+
+
 ## 2026.4
 
 

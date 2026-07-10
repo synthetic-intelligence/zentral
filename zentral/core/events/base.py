@@ -141,10 +141,16 @@ class EventRequestUser(object):
             val = getattr(self, attr)
             if val is not None:
                 if attr == "session":
-                    try:
-                        val["token"]["expiry"] = val["token"]["expiry"].isoformat()
-                    except KeyError:
-                        pass
+                    token = val.get("token")
+                    if token and isinstance(token.get("expiry"), datetime):
+                        # copy before converting: this session dict is shared by
+                        # every event built from a single request, so serialize()
+                        # must not mutate it in place (the next event serializes it
+                        # again and would choke on the already-stringified expiry)
+                        val = val.copy()
+                        token = token.copy()
+                        token["expiry"] = token["expiry"].isoformat()
+                        val["token"] = token
                 d[attr] = val
         return d
 

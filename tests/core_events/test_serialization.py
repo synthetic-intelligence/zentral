@@ -143,3 +143,49 @@ class EventSerializationTestCase(TestCase):
         self.assertIsInstance(er.user, EventRequestUser)
         self.assertEqual(er.geo.city_name, 'Hamburg')
         self.assertEqual(er.user.session["token"]["expiry"], datetime(1990, 2, 11))
+
+    @staticmethod
+    def _token_authenticated_user(expiry=datetime(1990, 2, 11), with_expiry=True):
+        token = {"pk": "00000000-0000-0000-0000-000000000001", "name": "token name"}
+        if with_expiry:
+            token["expiry"] = expiry
+        return EventRequestUser(
+            id=17, username="godzilla", email="godzilla@zentral.io",
+            is_remote=False, is_service_account=False, is_superuser=False,
+            session={"token_authenticated": True, "is_remote": False,
+                     "mfa_authenticated": False, "token": token},
+        )
+
+    def test_event_request_user_serialize_token_expiry(self):
+        user = self._token_authenticated_user()
+        d = user.serialize()
+        self.assertEqual(d["session"]["token"]["expiry"], "1990-02-11T00:00:00")
+        # the source session dict must not be mutated: it is shared by every
+        # event built from a single request, so serialize() must leave the
+        # datetime in place for the next event to serialize
+        self.assertEqual(user.session["token"]["expiry"], datetime(1990, 2, 11))
+
+    def test_event_request_user_serialize_is_idempotent(self):
+        # a single request builds one EventRequest and shares it across every
+        # event it emits (e.g. bulk machine tag changes); each event serializes
+        # the same user, so a second serialize() must not raise or differ
+        user = self._token_authenticated_user()
+        first = user.serialize()
+        second = user.serialize()
+        self.assertEqual(first, second)
+        self.assertEqual(second["session"]["token"]["expiry"], "1990-02-11T00:00:00")
+
+    def test_event_request_user_serialize_token_without_expiry(self):
+        user = self._token_authenticated_user(with_expiry=False)
+        d = user.serialize()
+        self.assertNotIn("expiry", d["session"]["token"])
+
+    def test_event_request_user_serialize_session_without_token(self):
+        user = EventRequestUser(
+            id=17, username="godzilla", email="godzilla@zentral.io",
+            is_remote=False, is_service_account=False, is_superuser=False,
+            session={"token_authenticated": False, "is_remote": False, "mfa_authenticated": True},
+        )
+        d = user.serialize()
+        self.assertNotIn("token", d["session"])
+        self.assertEqual(d["session"]["mfa_authenticated"], True)
