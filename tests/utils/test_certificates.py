@@ -1,9 +1,32 @@
 import datetime
 import os
+from types import SimpleNamespace
 from asn1crypto.core import UTF8String
+from cryptography import x509
+from cryptography.x509.oid import ExtensionOID
 from django.test import SimpleTestCase
 from zentral.utils.certificates import (is_ca, iter_cert_trees, iter_certificates, parse_apple_dev_id,
                                         parse_dn, parse_text_dn)
+
+
+class _FakeCert:
+    """Stand-in exposing .extensions.get_extension_for_oid for is_ca(); missing oids raise
+    ExtensionNotFound like cryptography does."""
+    def __init__(self, extensions):
+        self._extensions = extensions
+
+    @property
+    def extensions(self):
+        extensions = self._extensions
+
+        class _Extensions:
+            def get_extension_for_oid(self, oid):
+                try:
+                    return extensions[oid]
+                except KeyError:
+                    raise x509.ExtensionNotFound("not found", oid)
+
+        return _Extensions()
 
 
 class CertificatesTestCate(SimpleTestCase):
@@ -22,6 +45,25 @@ class CertificatesTestCate(SimpleTestCase):
         cert, ca_cert = list(iter_certificates(self.fullchain))
         self.assertEqual(is_ca(cert), False)
         self.assertEqual(is_ca(ca_cert), True)
+
+    def test_is_ca_unparseable_extensions(self):
+        class Cert:
+            @property
+            def extensions(self):
+                raise ValueError('error parsing asn1 value: ParseError { kind: EncodedDefault, '
+                                 'location: ["BasicConstraints::ca"] }')
+        self.assertEqual(is_ca(Cert()), False)
+
+    def test_is_ca_key_usage_fallback(self):
+        # no BasicConstraints -> fall back to KeyUsage.key_cert_sign
+        for key_cert_sign in (True, False):
+            cert = _FakeCert({ExtensionOID.KEY_USAGE:
+                              SimpleNamespace(value=SimpleNamespace(key_cert_sign=key_cert_sign))})
+            self.assertEqual(is_ca(cert), key_cert_sign)
+
+    def test_is_ca_no_relevant_extensions(self):
+        # neither BasicConstraints nor KeyUsage -> not a CA
+        self.assertEqual(is_ca(_FakeCert({})), False)
 
     def test_dev_id_match(self):
         self.assertEqual(

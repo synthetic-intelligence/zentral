@@ -131,14 +131,18 @@ def parse_apple_dev_id(cn):
 def is_ca(certificate):
     """Test if a x509 Certificate is a CA certificate"""
     # TODO: test self signed if no extensions found
-    extensions = certificate.extensions
     try:
-        return extensions.get_extension_for_oid(ExtensionOID.BASIC_CONSTRAINTS).value.ca
-    except x509.ExtensionNotFound:
+        extensions = certificate.extensions
         try:
-            return extensions.get_extension_for_oid(ExtensionOID.KEY_USAGE).value.key_cert_sign
+            return extensions.get_extension_for_oid(ExtensionOID.BASIC_CONSTRAINTS).value.ca
         except x509.ExtensionNotFound:
-            pass
+            try:
+                return extensions.get_extension_for_oid(ExtensionOID.KEY_USAGE).value.key_cert_sign
+            except x509.ExtensionNotFound:
+                pass
+    except ValueError:
+        # cryptography raises ValueError on a non-DER-canonical extension encoding
+        pass
     return False
 
 
