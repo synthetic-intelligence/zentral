@@ -17,8 +17,6 @@ def inventory_events_from_machine_snapshot_commit(machine_snapshot_commit):
     source = machine_snapshot_commit.source.serialize()
     diff = machine_snapshot_commit.update_diff()
     if diff is None:
-        machine_payload = machine_snapshot_commit.machine_snapshot.serialize()
-        machine_payload
         yield ('add_machine',
                None,
                machine_snapshot_commit.machine_snapshot.serialize(
