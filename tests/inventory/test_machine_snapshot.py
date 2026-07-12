@@ -1,8 +1,10 @@
 import copy
 from datetime import datetime, timedelta
+from unittest.mock import Mock, patch
 
 from dateutil import parser
 from django.core.cache import cache
+from django.db import IntegrityError
 from django.test import TestCase, override_settings
 from django.utils.timezone import is_aware, make_naive
 
@@ -15,6 +17,7 @@ from zentral.contrib.inventory.conf import (
     VM,
     os_version_display,
     os_version_version_display,
+    update_ms_tree_platform,
     update_ms_tree_type,
 )
 from zentral.contrib.inventory.models import (
@@ -171,6 +174,45 @@ class MachineSnapshotTestCase(TestCase):
         tree = copy.deepcopy(self.machine_snapshot)
         msc, ms, _ = MachineSnapshotCommit.objects.commit_machine_snapshot_tree(tree)
         self.assertIsNone(msc.get_system_update_display())
+
+    def test_machine_snapshot_commit_different_snapshot_race_skips(self):
+        # a concurrent commit took the version with a different snapshot -> skip, don't 500
+        msc1, ms1, _ = MachineSnapshotCommit.objects.commit_machine_snapshot_tree(
+            copy.deepcopy(self.machine_snapshot))
+
+        def losing_create(**kwargs):
+            raise IntegrityError("duplicate key value violates unique constraint")
+
+        with patch.object(MachineSnapshotCommit.objects, "create", side_effect=losing_create), \
+             patch.object(MachineSnapshotCommit.objects, "get",
+                          return_value=Mock(machine_snapshot=ms1, last_seen=msc1.last_seen)):
+            msc2, ms2, _ = MachineSnapshotCommit.objects.commit_machine_snapshot_tree(
+                copy.deepcopy(self.machine_snapshot5))
+        self.assertIsNone(msc2)
+        self.assertNotEqual(ms2, ms1)
+        self.assertEqual(
+            MachineSnapshotCommit.objects.filter(serial_number=self.serial_number, source=ms1.source).count(),
+            1,
+        )
+
+    def test_machine_snapshot_commit_same_snapshot_race_skips(self):
+        msc1, ms1, _ = MachineSnapshotCommit.objects.commit_machine_snapshot_tree(
+            copy.deepcopy(self.machine_snapshot))
+        tree = copy.deepcopy(self.machine_snapshot5)
+        update_ms_tree_platform(tree)
+        update_ms_tree_type(tree)
+        ms2 = MachineSnapshot.objects.commit(tree)[0]
+
+        def losing_create(**kwargs):
+            raise IntegrityError("duplicate key value violates unique constraint")
+
+        with patch.object(MachineSnapshotCommit.objects, "create", side_effect=losing_create), \
+             patch.object(MachineSnapshotCommit.objects, "get",
+                          return_value=Mock(machine_snapshot=ms2, last_seen=msc1.last_seen)):
+            msc2, ms, _ = MachineSnapshotCommit.objects.commit_machine_snapshot_tree(
+                copy.deepcopy(self.machine_snapshot5))
+        self.assertIsNone(msc2)
+        self.assertEqual(ms, ms2)
 
     def test_machine_snapshot_commit_source_error(self):
         tree = copy.deepcopy(self.machine_snapshot_source_error)

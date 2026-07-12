@@ -27,7 +27,7 @@ from zentral.conf import settings
 from zentral.core.compliance_checks.utils import get_machine_compliance_check_statuses
 from zentral.core.incidents.models import MachineIncident, Status
 from zentral.utils.model_extras import find_all_related_objects
-from zentral.utils.mt_models import AbstractMTObject, MTObjectManager, MTOError, prepare_commit_tree
+from zentral.utils.mt_models import AbstractMTObject, MTObjectManager, prepare_commit_tree
 from zentral.utils.time import naive_utcnow
 
 from .conf import (
@@ -727,16 +727,19 @@ class MachineSnapshotCommitManager(models.Manager):
                                                                           'last_seen': last_seen})
                 return new_msc, machine_snapshot, last_seen
         except IntegrityError:
+            # A concurrent commit for the same machine took this version. Skip rather than fail the
+            # request: the current snapshot is already up to date and the next check-in reconciles
+            # (a differing snapshot just means a tree field changed inside the race window).
             msc = MachineSnapshotCommit.objects.get(serial_number=serial_number,
                                                     source=source,
                                                     version=new_version)
-            if msc.machine_snapshot == machine_snapshot:
+            if msc.machine_snapshot != machine_snapshot:
+                logger.warning("MachineSnapshotCommit race with a different snapshot for "
+                               "source {} and serial_number {}".format(source, serial_number))
+            else:
                 logger.warning("MachineSnapshotCommit race with same snapshot for "
                                "source {} and serial_number {}".format(source, serial_number))
-                return None, machine_snapshot, msc.last_seen
-            else:
-                raise MTOError("MachineSnapshotCommit race for "
-                               "source {} and serial_number {}".format(source, serial_number))
+            return None, machine_snapshot, msc.last_seen
 
 
 class MachineSnapshotCommit(models.Model):
