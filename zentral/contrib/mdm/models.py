@@ -3271,6 +3271,14 @@ class TargetArtifact(models.Model):
         def present(self):
             return self.value in (self.ACKNOWLEDGED, self.INSTALLED)
 
+        @property
+        def presence_rank(self):
+            # higher wins when a device reports the same artifact version more than once in a
+            # status report (see get_status_report_target_artifacts_info)
+            return (self.FAILED, self.REMOVAL_FAILED, self.UNINSTALLED,
+                    self.AWAITING_CONFIRMATION, self.FORCE_REINSTALL,
+                    self.ACKNOWLEDGED, self.INSTALLED).index(self)
+
     artifact_version = models.ForeignKey(ArtifactVersion, on_delete=models.PROTECT)
     status = models.CharField(
         max_length=64,

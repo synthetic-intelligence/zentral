@@ -9,7 +9,9 @@ from zentral.contrib.mdm.declarations import (
     get_artifact_identifier,
     get_artifact_version_server_token,
 )
-from zentral.contrib.mdm.models import Artifact, Declaration
+from zentral.contrib.mdm.declarations.status_report import get_status_report_target_artifacts_info
+from zentral.contrib.mdm.models import Artifact, Declaration, TargetArtifact
+from zentral.utils.payloads import get_payload_identifier
 
 
 class MDMDeclarationUtilsTestCase(TestCase):
@@ -84,3 +86,71 @@ class MDMDeclarationUtilsTestCase(TestCase):
             0
         )
         self.assertEqual(server_token, f"{av_pk}.ri-1")
+
+
+class MDMStatusReportTargetArtifactsInfoTestCase(TestCase):
+    @staticmethod
+    def _report(items):
+        return {"StatusItems": {"management": {"declarations": {
+            "activations": [], "assets": [], "configurations": items, "management": [],
+        }}}}
+
+    @staticmethod
+    def _item(artifact_pk, server_token, active, valid):
+        return {"identifier": get_payload_identifier("declaration", str(artifact_pk)),
+                "server-token": server_token, "active": active, "valid": valid}
+
+    def test_dedup_same_version_keeps_most_present(self):
+        # same artifact version reported under two server-tokens (a re-push) -> one entry
+        artifact_pk, av_pk = uuid.uuid4(), uuid.uuid4()
+        report = self._report([
+            self._item(artifact_pk, str(av_pk), True, "unknown"),     # AwaitingConfirmation
+            self._item(artifact_pk, f"{av_pk}.rc-1", True, "valid"),  # Installed
+        ])
+        with self.assertLogs("zentral.contrib.mdm.declarations.status_report", level="WARNING") as cm:
+            info = get_status_report_target_artifacts_info(report)
+        self.assertEqual(len(info), 1)
+        self.assertEqual(info[0][1], str(av_pk))
+        self.assertEqual(info[0][2], TargetArtifact.Status.INSTALLED)
+        self.assertTrue(any(f"Duplicate artifact version {av_pk}" in m
+                            and f"server tokens {av_pk} and {av_pk}.rc-1" in m for m in cm.output))
+
+    def test_dedup_most_present_is_order_independent(self):
+        artifact_pk, av_pk = uuid.uuid4(), uuid.uuid4()
+        info = get_status_report_target_artifacts_info(self._report([
+            self._item(artifact_pk, str(av_pk), True, "valid"),        # Installed
+            self._item(artifact_pk, f"{av_pk}.rc-1", True, "unknown"),  # AwaitingConfirmation
+        ]))
+        self.assertEqual(len(info), 1)
+        self.assertEqual(info[0][2], TargetArtifact.Status.INSTALLED)
+
+    def test_dedup_three_occurrences_keeps_most_present(self):
+        # same version reported 3x, most present (Installed) in the middle -> one entry, most present
+        artifact_pk, av_pk = uuid.uuid4(), uuid.uuid4()
+        with self.assertLogs("zentral.contrib.mdm.declarations.status_report", level="WARNING") as cm:
+            info = get_status_report_target_artifacts_info(self._report([
+                self._item(artifact_pk, str(av_pk), False, "unknown"),      # Uninstalled
+                self._item(artifact_pk, f"{av_pk}.rc-1", True, "valid"),    # Installed
+                self._item(artifact_pk, f"{av_pk}.rc-2", True, "unknown"),  # AwaitingConfirmation
+            ]))
+        self.assertEqual(len(info), 1)
+        self.assertEqual(info[0][1], str(av_pk))
+        self.assertEqual(info[0][2], TargetArtifact.Status.INSTALLED)
+        self.assertEqual(len(cm.output), 2)  # one warning per duplicate after the first
+
+    def test_distinct_versions_not_deduped(self):
+        artifact_pk = uuid.uuid4()
+        info = get_status_report_target_artifacts_info(self._report([
+            self._item(artifact_pk, str(uuid.uuid4()), True, "valid"),
+            self._item(artifact_pk, str(uuid.uuid4()), True, "valid"),
+        ]))
+        self.assertEqual(len(info), 2)
+
+    def test_status_presence_rank_ordering(self):
+        Status = TargetArtifact.Status
+        self.assertGreater(Status.INSTALLED.presence_rank, Status.AWAITING_CONFIRMATION.presence_rank)
+        self.assertGreater(Status.AWAITING_CONFIRMATION.presence_rank, Status.UNINSTALLED.presence_rank)
+        self.assertGreater(Status.UNINSTALLED.presence_rank, Status.FAILED.presence_rank)
+        # every present status outranks every non-present one
+        self.assertGreater(min(s.presence_rank for s in Status if s.present),
+                           max(s.presence_rank for s in Status if not s.present))

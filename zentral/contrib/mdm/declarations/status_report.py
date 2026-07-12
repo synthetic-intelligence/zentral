@@ -38,20 +38,24 @@ def get_status_report_target_artifacts_info(status_report):
     except KeyError:
         logger.debug("Status report without declarations section")
         return
-    target_artifacts_info = []
+    # A re-pushed artifact version can be reported under two server-tokens in one report; both
+    # map to one artifact_version_pk, which the target-artifact upsert can't accept twice. Keep
+    # one entry per version, the most present.
+    info_by_artifact_version = {}
     for section in ("activations", "assets", "configurations", "management"):
         for item in declarations.get(section, []):
             try:
                 _, artifact_pk = parse_artifact_identifier(item["identifier"])
             except ValueError:
-                pass
-            else:
-                artifact_version_pk, status, extra_info, server_token = get_target_artifact_info(item)
-                target_artifacts_info.append((
-                    artifact_pk,
-                    artifact_version_pk,
-                    status,
-                    extra_info,
-                    server_token,
-                ))
-    return target_artifacts_info
+                continue
+            artifact_version_pk, status, extra_info, server_token = get_target_artifact_info(item)
+            existing = info_by_artifact_version.get(artifact_version_pk)
+            if existing is not None:
+                logger.warning("Duplicate artifact version %s in status report (server tokens %s and %s)",
+                               artifact_version_pk, existing[4], server_token)
+                if status.presence_rank <= existing[2].presence_rank:
+                    continue
+            info_by_artifact_version[artifact_version_pk] = (
+                artifact_pk, artifact_version_pk, status, extra_info, server_token,
+            )
+    return list(info_by_artifact_version.values())
