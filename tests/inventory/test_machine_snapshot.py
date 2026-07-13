@@ -32,7 +32,7 @@ from zentral.contrib.inventory.models import (
     Tag,
 )
 from zentral.contrib.inventory.utils.db import inventory_events_from_machine_snapshot_commit
-from zentral.utils.mt_models import MTOError
+from zentral.utils.mt_models import MTOError, prepare_commit_tree
 from zentral.utils.time import naive_utcnow
 
 
@@ -327,9 +327,46 @@ class MachineSnapshotTestCase(TestCase):
     def test_duplicated_subtrees(self):
         tree = copy.deepcopy(self.machine_snapshot3)
         tree["osx_app_instances"].append(copy.deepcopy(self.osx_app_instance2))
-        with self.assertRaises(MTOError,
-                               msg="Duplicated subtree in key osx_app_instances"):
-            MachineSnapshot.objects.commit(tree)
+        with self.assertLogs("zentral.utils.mt_models", level="WARNING") as cm:
+            ms, created = MachineSnapshot.objects.commit(tree)
+        self.assertEqual(
+            cm.output,
+            ["WARNING:zentral.utils.mt_models:1 duplicated subtree(s) removed from key osx_app_instances"]
+        )
+        self.assertTrue(created)
+        self.assertEqual(ms.osx_app_instances.count(), 2)
+        ms.refresh_from_db()
+        self.assertEqual(ms.hash(), ms.mt_hash)
+        # same snapshot as the one committed from the tree without the duplicate
+        ms2, created2 = MachineSnapshot.objects.commit(copy.deepcopy(self.machine_snapshot3))
+        self.assertFalse(created2)
+        self.assertEqual(ms, ms2)
+
+    def test_prepare_commit_tree_datetime_list_items(self):
+        dt = parser.parse('2035/02/09 22:40:36 +0100')
+        tree = {"un": [dt]}
+        prepare_commit_tree(tree)
+        tree_naive = {"un": [make_naive(dt)]}
+        prepare_commit_tree(tree_naive)
+        self.assertEqual(tree["mt_hash"], tree_naive["mt_hash"])
+
+    def test_prepare_commit_tree_unsupported_list_item_type(self):
+        with self.assertRaises(MTOError) as cm:
+            prepare_commit_tree({"un": [object()]})
+        self.assertEqual(cm.exception.message, "Unsupported list item type")
+
+    def test_duplicated_subtrees_in_json_field(self):
+        tree = copy.deepcopy(self.machine_snapshot)
+        tree["extra_facts"] = {"un": [{"a": 1}, {"a": 1}, "deux"]}
+        with self.assertLogs("zentral.utils.mt_models", level="WARNING") as cm:
+            ms, _ = MachineSnapshot.objects.commit(tree)
+        self.assertEqual(
+            cm.output,
+            ["WARNING:zentral.utils.mt_models:1 duplicated subtree(s) removed from key un"]
+        )
+        self.assertEqual(ms.extra_facts, {"un": [{"a": 1}, "deux"]})
+        ms.refresh_from_db()
+        self.assertEqual(ms.hash(), ms.mt_hash)
 
     def test_commit_certificate(self):
         tree = copy.deepcopy(self.certificate)

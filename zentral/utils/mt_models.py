@@ -1,10 +1,14 @@
 import copy
 from datetime import datetime
 import hashlib
+import logging
 from django.core.exceptions import FieldDoesNotExist
 from django.utils.functional import cached_property
 from django.utils.timezone import is_aware, make_naive
 from django.db import IntegrityError, models, transaction
+
+
+logger = logging.getLogger("zentral.utils.mt_models")
 
 
 class MTOError(Exception):
@@ -69,12 +73,17 @@ def prepare_commit_tree(tree):
                 v = v['mt_hash']
             elif isinstance(v, list):
                 hash_list = []
+                skipped_item_idxs = None
                 for item_idx, item in enumerate(v):
                     if isinstance(item, dict):
                         prepare_commit_tree(item)
                         subtree_mt_hash = item['mt_hash']
                         if subtree_mt_hash in hash_list:
-                            raise MTOError("Duplicated subtree in key {}".format(k))
+                            # a list of subtrees maps to a many to many relationship, i.e. a set:
+                            # a duplicated subtree carries no information and could never be committed → skip it
+                            if skipped_item_idxs is None:
+                                skipped_item_idxs = []
+                            skipped_item_idxs.append(item_idx)
                         else:
                             hash_list.append(subtree_mt_hash)
                     else:
@@ -90,8 +99,14 @@ def prepare_commit_tree(tree):
                             item_to_hash = "s∅" + item
                         else:
                             raise MTOError("Unsupported list item type")
-                        item_to_hash = str(item_idx) + item_to_hash  # order is important
+                        # order is important. The position in the hash list — the item index in the
+                        # filtered list when subtrees have been skipped — keeps the hash consistent
+                        # with the stored value.
+                        item_to_hash = str(len(hash_list)) + item_to_hash
                         hash_list.append(hashlib.sha1(item_to_hash.encode('utf-8')).hexdigest())
+                if skipped_item_idxs is not None:
+                    logger.warning("%d duplicated subtree(s) removed from key %s", len(skipped_item_idxs), k)
+                    tree[k] = [item for item_idx, item in enumerate(v) if item_idx not in skipped_item_idxs]
                 v = hash_list
             elif isinstance(v, datetime) and is_aware(v):
                 tree[k] = v = make_naive(v)
