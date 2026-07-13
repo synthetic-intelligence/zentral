@@ -95,14 +95,10 @@ def commit_machine_snapshot_and_trigger_events(tree):
 
 
 def commit_machine_snapshot_and_yield_events(tree):
-    try:
-        msc, _, last_seen = MachineSnapshotCommit.objects.commit_machine_snapshot_tree(tree)
-    except Exception:
-        logger.exception("Could not commit machine snapshot")
-        raise
-    else:
-        # inventory events
-        if msc:
-            yield from iter_inventory_events(msc.serial_number, inventory_events_from_machine_snapshot_commit(msc))
-        # compliance checks
-        yield from jmespath_checks_cache.process_tree(tree, last_seen)
+    # errors are handled by the callers, in the preprocessors for example
+    msc, _, last_seen = MachineSnapshotCommit.objects.commit_machine_snapshot_tree(tree)
+    # inventory events
+    if msc:
+        yield from iter_inventory_events(msc.serial_number, inventory_events_from_machine_snapshot_commit(msc))
+    # compliance checks
+    yield from jmespath_checks_cache.process_tree(tree, last_seen)
