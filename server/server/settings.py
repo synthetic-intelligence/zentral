@@ -194,7 +194,11 @@ DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
         'ATOMIC_REQUESTS': True,
-        'CONN_MAX_AGE': 3600
+        'CONN_MAX_AGE': 3600,
+        # idle persistent connections may be closed by the DB server or a connection pooler; verify before reuse
+        'CONN_HEALTH_CHECKS': True,
+        # cap connection setup so a stalled connect fails fast rather than hanging the request
+        'OPTIONS': {'connect_timeout': 10}
     }
 }
 # Populate DATABASES with the following variables from the zentral conf:
