@@ -27,9 +27,9 @@ class Hasher(object):
 
     def add_field(self, k, v):
         if not isinstance(k, str) or not k:
-            raise ValueError("Invalid field name {}".format(k))
+            raise ValueError(f"Invalid field name {k}")
         if k in self.fields:
-            raise ValueError("Field {} already added".format(k))
+            raise ValueError(f"Field {k} already added")
         if self.is_empty_value(v):
             return
         elif isinstance(v, int):
@@ -41,7 +41,7 @@ class Hasher(object):
         elif isinstance(v, list):
             assert(all([isinstance(e, str) and len(e) == 40 for e in v]))
         elif not isinstance(v, str):
-            raise ValueError("Invalid field value {} for field {}".format(v, k))
+            raise ValueError(f"Invalid field value {v} for field {k}")
         self.fields[k] = v
 
     def hexdigest(self):
@@ -150,7 +150,7 @@ class MTObjectManager(models.Manager):
                             cleanup_commit_tree(t)
                             setattr(obj, k, t)
                         else:
-                            raise MTOError('Cannot set field "{}" to dict value'.format(k))
+                            raise MTOError(f'Cannot set field "{k}" to dict value')
                     else:
                         fk_obj, _ = f.related_model.objects.commit(v)
                         setattr(obj, k, fk_obj)
@@ -179,7 +179,7 @@ class MTObjectManager(models.Manager):
                     raise integrity_error
             else:
                 if not obj.hash(recursive=False) == obj.mt_hash:
-                    raise MTOError('Obj {} Hash missmatch!!!'.format(obj))
+                    raise MTOError(f'Obj {obj} Hash missmatch!!!')
                 created = True
         return obj, created
 
@@ -203,15 +203,13 @@ class AbstractMTObject(models.Model):
 
     def get_mt_field(self, name, many_to_one=None, many_to_many=None):
         if name in self.mt_excluded_field_set:
-            raise MTOError("Field '{}' of {} is excluded".format(name,
-                                                                 self._meta.object_name))
+            raise MTOError(f"Field '{name}' of {self._meta.object_name} is excluded")
         try:
             f = self._meta.get_field(name)
         except FieldDoesNotExist as e:
             raise MTOError(str(e))
         if f.auto_created:
-            raise MTOError("Field '{}' of {} auto created".format(name,
-                                                                  self._meta.object_name))
+            raise MTOError(f"Field '{name}' of {self._meta.object_name} auto created")
         if many_to_one:
             assert(many_to_many is None)
             many_to_many = False
@@ -219,10 +217,8 @@ class AbstractMTObject(models.Model):
             assert(many_to_one is None)
             many_to_one = False
         if f.many_to_one != many_to_one or f.many_to_many != many_to_many:
-            raise MTOError("Field '{}' of {} has "
-                           "many_to_one: {}, many_to_many: {}".format(name,
-                                                                      self._meta.object_name,
-                                                                      f.many_to_one, f.many_to_many))
+            raise MTOError(f"Field '{name}' of {self._meta.object_name} has "
+                           f"many_to_one: {f.many_to_one}, many_to_many: {f.many_to_many}")
         return f
 
     def _iter_mto_fields(self):
@@ -265,8 +261,7 @@ class AbstractMTObject(models.Model):
             elif isinstance(v, datetime):
                 v = v.isoformat()
             elif v and not isinstance(v, (str, int, dict)):
-                raise ValueError("Can't serialize {}.{} value of type {}".format(self._meta.object_name,
-                                                                                 f.name, type(v)))
+                raise ValueError(f"Can't serialize {self._meta.object_name}.{f.name} value of type {type(v)}")
             if Hasher.is_empty_value(v):
                 continue
             else:
