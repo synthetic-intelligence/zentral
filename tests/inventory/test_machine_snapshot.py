@@ -388,6 +388,82 @@ class MachineSnapshotTestCase(TestCase):
         cert, _ = Certificate.objects.commit(tree)
         self.assertEqual(cert.short_repr(), "Apple Certification Authority")
 
+    def test_commit_certificate_serialized_datetimes(self):
+        tree = copy.deepcopy(self.certificate)
+        tree["valid_from"] = "2006-04-25T21:40:36Z"
+        tree["valid_until"] = "2035-02-09T21:40:36Z"
+        cert, created = Certificate.objects.commit(tree)
+        self.assertTrue(created)
+        cert.refresh_from_db()
+        self.assertEqual(cert.hash(), cert.mt_hash)
+        self.assertEqual(cert.valid_from, datetime(2006, 4, 25, 21, 40, 36))
+        self.assertEqual(cert.valid_until, datetime(2035, 2, 9, 21, 40, 36))
+        # same certificate serialized with datetime objects → same object
+        cert2, created2 = Certificate.objects.commit(copy.deepcopy(self.certificate))
+        self.assertFalse(created2)
+        self.assertEqual(cert, cert2)
+
+    def test_commit_certificate_equivalent_serialized_datetimes(self):
+        mt_hashes = set()
+        pks = set()
+        for valid_from in ("2022-01-01T21:40:36Z",
+                           "2022-01-01T21:40:36+00:00",
+                           "2022-01-01T23:40:36+02:00",
+                           "2022-01-01 21:40:36",
+                           datetime(2022, 1, 1, 21, 40, 36)):
+            tree = copy.deepcopy(self.certificate1)
+            tree["valid_from"] = valid_from
+            cert, _ = Certificate.objects.commit(tree)
+            mt_hashes.add(cert.mt_hash)
+            pks.add(cert.pk)
+        self.assertEqual(len(mt_hashes), 1)
+        self.assertEqual(len(pks), 1)
+
+    def test_commit_certificate_invalid_serialized_datetime(self):
+        tree = copy.deepcopy(self.certificate)
+        tree["valid_from"] = "yolo"
+        with self.assertRaises(MTOError) as cm:
+            Certificate.objects.commit(tree)
+        self.assertEqual(cm.exception.message, 'Invalid serialized datetime "yolo" for field valid_from')
+
+    def test_commit_machine_snapshot_tree_serialized_datetimes(self):
+        tree = copy.deepcopy(self.machine_snapshot3)
+        for osx_app_instance in tree["osx_app_instances"]:
+            signed_by = osx_app_instance["signed_by"]
+            signed_by["valid_from"] = "2006-04-25T21:40:36Z"
+            signed_by["valid_until"] = "2035-02-09T21:40:36Z"
+        tree["certificates"] = [{"common_name": "Zentral CA",
+                                 "organization": "Zentral",
+                                 "valid_from": "2015-10-16T04:17:39Z",
+                                 "valid_until": "2025-10-13T04:17:39Z"}]
+        tree["profiles"] = [{"uuid": "e6dd0e0b-0f92-4a58-9d41-3a4c04a1b7dd",
+                             "display_name": "Zentral Profile",
+                             "install_date": "2026-04-01T08:30:31Z"}]
+        tree["program_instances"] = [{"program": {"name": "Zentral Agent", "version": "1.0"},
+                                      "install_date": "2026-04-01T10:30:31+02:00"}]
+        msc, ms, _ = MachineSnapshotCommit.objects.commit_machine_snapshot_tree(tree)
+        ms.refresh_from_db()
+        self.assertEqual(ms.hash(), ms.mt_hash)
+        certificate = ms.certificates.get()
+        self.assertEqual(certificate.valid_from, datetime(2015, 10, 16, 4, 17, 39))
+        profile = ms.profiles.get()
+        self.assertEqual(profile.install_date, datetime(2026, 4, 1, 8, 30, 31))
+        program_instance = ms.program_instances.get()
+        self.assertEqual(program_instance.install_date, datetime(2026, 4, 1, 8, 30, 31))
+
+    def test_commit_extra_facts_serialized_datetime_untouched(self):
+        tree = copy.deepcopy(self.machine_snapshot)
+        tree["extra_facts"] = {"last_boot": "2026-04-01T08:30:31Z"}
+        ms, _ = MachineSnapshot.objects.commit(tree)
+        ms.refresh_from_db()
+        self.assertEqual(ms.extra_facts, {"last_boot": "2026-04-01T08:30:31Z"})
+        self.assertEqual(ms.hash(), ms.mt_hash)
+
+    def test_prepare_commit_tree_no_model_serialized_datetime_untouched(self):
+        tree = {"un": "2026-04-01T08:30:31Z"}
+        prepare_commit_tree(tree)
+        self.assertEqual(tree["un"], "2026-04-01T08:30:31Z")
+
     def test_ordered_certificates(self):
         tree = copy.deepcopy(self.machine_snapshot5)
         _, ms, _ = MachineSnapshotCommit.objects.commit_machine_snapshot_tree(tree)

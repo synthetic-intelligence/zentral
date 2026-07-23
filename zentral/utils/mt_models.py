@@ -2,7 +2,7 @@ import copy
 from datetime import datetime
 import hashlib
 import logging
-from django.core.exceptions import FieldDoesNotExist
+from django.core.exceptions import FieldDoesNotExist, ValidationError
 from django.utils.functional import cached_property
 from django.utils.timezone import is_aware, make_naive
 from django.db import IntegrityError, models, transaction
@@ -59,7 +59,21 @@ class Hasher(object):
         return h.hexdigest()
 
 
-def prepare_commit_tree(tree):
+def _get_commit_tree_field(model, name):
+    if model is None:
+        return None
+    try:
+        f = model._meta.get_field(name)
+    except FieldDoesNotExist:
+        return None
+    if f.auto_created or isinstance(f, models.JSONField):
+        # auto created fields are rejected later in the commit method,
+        # and JSONField values round-trip unchanged → their subtrees stay model-free
+        return None
+    return f
+
+
+def prepare_commit_tree(tree, model=None):
     if not isinstance(tree, dict):
         raise MTOError("Commit tree is not a dict")
     if tree.get('mt_hash', None):
@@ -69,15 +83,17 @@ def prepare_commit_tree(tree):
         if h.is_empty_value(v):
             tree.pop(k)
         else:
+            f = _get_commit_tree_field(model, k)
             if isinstance(v, dict):
-                prepare_commit_tree(v)
+                prepare_commit_tree(v, f.related_model if f is not None and f.many_to_one else None)
                 v = v['mt_hash']
             elif isinstance(v, list):
+                related_model = f.related_model if f is not None and f.many_to_many else None
                 hash_list = []
                 skipped_item_idxs = None
                 for item_idx, item in enumerate(v):
                     if isinstance(item, dict):
-                        prepare_commit_tree(item)
+                        prepare_commit_tree(item, related_model)
                         subtree_mt_hash = item['mt_hash']
                         if subtree_mt_hash in hash_list:
                             # a list of subtrees maps to a many to many relationship, i.e. a set:
@@ -109,6 +125,16 @@ def prepare_commit_tree(tree):
                     logger.warning("%d duplicated subtree(s) removed from key %s", len(skipped_item_idxs), k)
                     tree[k] = [item for item_idx, item in enumerate(v) if item_idx not in skipped_item_idxs]
                 v = hash_list
+            elif isinstance(v, str) and isinstance(f, models.DateTimeField):
+                # replace a serialized datetime with the naive datetime that will resurface
+                # from the DB, so that the tree hash matches the committed object hash
+                try:
+                    v = f.to_python(v)
+                except ValidationError:
+                    raise MTOError(f'Invalid serialized datetime "{v}" for field {k}')
+                if is_aware(v):
+                    v = make_naive(v)
+                tree[k] = v
             elif isinstance(v, datetime) and is_aware(v):
                 tree[k] = v = make_naive(v)
             h.add_field(k, v)
@@ -129,7 +155,7 @@ def cleanup_commit_tree(tree):
 
 class MTObjectManager(models.Manager):
     def commit(self, tree, **extra_obj_save_kwargs):
-        prepare_commit_tree(tree)
+        prepare_commit_tree(tree, self.model)
         created = False
         try:
             obj = self.get(mt_hash=tree['mt_hash'])
