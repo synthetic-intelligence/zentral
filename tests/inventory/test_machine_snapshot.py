@@ -720,3 +720,56 @@ class MachineSnapshotTestCase(TestCase):
         self.assertEqual(msc3.machine_snapshot, ms)
         self.assertEqual(msc3.update_diff(),
                          {"last_seen": {"added": last_seen3, "removed": last_seen}})
+
+    def test_last_seen_naive_string(self):
+        tree = copy.deepcopy(self.machine_snapshot)
+        tree["last_seen"] = "2026-07-24T10:11:12"
+        msc, _, last_seen = MachineSnapshotCommit.objects.commit_machine_snapshot_tree(tree)
+        self.assertEqual(msc.last_seen, datetime(2026, 7, 24, 10, 11, 12))
+        self.assertEqual(last_seen, datetime(2026, 7, 24, 10, 11, 12))
+
+    def test_last_seen_aware_string(self):
+        tree = copy.deepcopy(self.machine_snapshot)
+        tree["last_seen"] = "2026-07-24T10:11:12+02:00"
+        msc, _, _ = MachineSnapshotCommit.objects.commit_machine_snapshot_tree(tree)
+        self.assertEqual(msc.last_seen, datetime(2026, 7, 24, 8, 11, 12))
+        tree = copy.deepcopy(self.machine_snapshot)
+        tree["last_seen"] = "2026-07-24T10:11:12Z"
+        msc2, _, _ = MachineSnapshotCommit.objects.commit_machine_snapshot_tree(tree)
+        self.assertEqual(msc2.last_seen, datetime(2026, 7, 24, 10, 11, 12))
+
+    def test_last_seen_unparseable_string(self):
+        tree = copy.deepcopy(self.machine_snapshot)
+        tree["last_seen"] = "yolo"
+        t0 = naive_utcnow()
+        with self.assertLogs("zentral.contrib.inventory.models", level="ERROR") as cm:
+            msc, _, last_seen = MachineSnapshotCommit.objects.commit_machine_snapshot_tree(tree)
+        self.assertEqual(cm.output,
+                         ["ERROR:zentral.contrib.inventory.models:Could not parse commit tree last_seen"])
+        self.assertTrue(t0 <= msc.last_seen <= naive_utcnow())
+        self.assertEqual(msc.last_seen, last_seen)
+
+    def test_last_seen_aware_datetime(self):
+        tree = copy.deepcopy(self.machine_snapshot)
+        tree["last_seen"] = parser.parse("2026-07-24T10:11:12+02:00")
+        msc, _, _ = MachineSnapshotCommit.objects.commit_machine_snapshot_tree(tree)
+        self.assertEqual(msc.last_seen, datetime(2026, 7, 24, 8, 11, 12))
+
+    def test_last_seen_missing(self):
+        tree = copy.deepcopy(self.machine_snapshot)
+        t0 = naive_utcnow()
+        with self.assertNoLogs("zentral.contrib.inventory.models", level="ERROR"):
+            msc, _, last_seen = MachineSnapshotCommit.objects.commit_machine_snapshot_tree(tree)
+        self.assertTrue(t0 <= msc.last_seen <= naive_utcnow())
+        self.assertEqual(msc.last_seen, last_seen)
+
+    def test_last_seen_wrong_type(self):
+        tree = copy.deepcopy(self.machine_snapshot)
+        tree["last_seen"] = 17
+        t0 = naive_utcnow()
+        with self.assertLogs("zentral.contrib.inventory.models", level="ERROR") as cm:
+            msc, _, last_seen = MachineSnapshotCommit.objects.commit_machine_snapshot_tree(tree)
+        self.assertEqual(cm.output,
+                         ["ERROR:zentral.contrib.inventory.models:Commit tree last seen is not a str or a datetime"])
+        self.assertTrue(t0 <= msc.last_seen <= naive_utcnow())
+        self.assertEqual(msc.last_seen, last_seen)

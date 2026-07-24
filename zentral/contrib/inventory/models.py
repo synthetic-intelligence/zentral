@@ -4,7 +4,7 @@ import logging
 import re
 import urllib.parse
 from collections import Counter
-from datetime import timedelta
+from datetime import timedelta, datetime
 
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
@@ -28,7 +28,7 @@ from zentral.core.compliance_checks.utils import get_machine_compliance_check_st
 from zentral.core.incidents.models import MachineIncident, Status
 from zentral.utils.model_extras import find_all_related_objects
 from zentral.utils.mt_models import AbstractMTObject, MTObjectManager, prepare_commit_tree
-from zentral.utils.time import naive_utcnow
+from zentral.utils.time import naive_utcnow, naive_utc_fromisoformat
 
 from .conf import (
     PLATFORM_CHOICES,
@@ -688,10 +688,21 @@ class MachineSnapshot(AbstractMTObject):
 class MachineSnapshotCommitManager(models.Manager):
     def commit_machine_snapshot_tree(self, tree):
         last_seen = tree.pop('last_seen', None)
+        if isinstance(last_seen, str):
+            try:
+                last_seen = naive_utc_fromisoformat(last_seen)
+            except Exception:
+                logger.error("Could not parse commit tree last_seen")
+                last_seen = None
+        elif isinstance(last_seen, datetime):
+            if timezone.is_aware(last_seen):
+                last_seen = timezone.make_naive(last_seen)
+        elif last_seen is not None:
+            # a missing last_seen is normal (Santa, MDM, … trees) and gets the current time below
+            logger.error("Commit tree last seen is not a str or a datetime")
+            last_seen = None
         if not last_seen:
             last_seen = naive_utcnow()
-        if timezone.is_aware(last_seen):
-            last_seen = timezone.make_naive(last_seen)
         system_uptime = tree.pop('system_uptime', None)
         update_ms_tree_platform(tree)
         update_ms_tree_type(tree)
